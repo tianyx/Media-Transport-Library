@@ -158,6 +158,8 @@ struct st_tx_video_pacing {
   uint32_t pacing_time_stamp;
   double tsc_time_cursor; /* in ns, tsc time cursor for packet pacing */
   double ptp_time_cursor; /* in ns, ptp time cursor for packet pacing */
+  /* ptp time may onward */
+  uint32_t max_onward_epochs;
 };
 
 enum st20_packet_type {
@@ -350,6 +352,7 @@ struct st_tx_video_session_impl {
   int stat_build_ret_code;
   uint64_t stat_last_time;
   uint32_t stat_epoch_drop;
+  uint32_t stat_epoch_onward;
   uint32_t stat_error_user_timestamp;
   uint32_t stat_epoch_troffset_mismatch; /* pacing mismatch the epoch troffset */
   uint32_t stat_trans_troffset_mismatch; /* transmitter mismatch the epoch troffset */
@@ -704,7 +707,10 @@ struct st_tx_audio_session_pacing {
   uint32_t rtp_time_stamp;
   /* timestamp for pacing */
   uint32_t pacing_time_stamp;
-  uint64_t tsc_time_cursor; /* in ns, tsc time cursor for packet pacing */
+  /* in ns, tsc time cursor for packet pacing */
+  uint64_t tsc_time_cursor;
+  /* ptp time may onward */
+  uint32_t max_onward_epochs;
 };
 
 struct st_tx_audio_session_impl {
@@ -752,7 +758,10 @@ struct st_tx_audio_session_impl {
   /* stat */
   rte_atomic32_t st30_stat_frame_cnt;
   int st30_stat_pkt_cnt;
-  uint32_t st30_epoch_mismatch; /* count of frame lower than pacing */
+  /* count of frame not match the epoch */
+  uint32_t stat_epoch_mismatch;
+  uint32_t stat_epoch_drop;
+  uint32_t stat_epoch_onward;
   uint32_t stat_error_user_timestamp;
 };
 
@@ -895,6 +904,8 @@ struct st_tx_ancillary_session_pacing {
   /* timestamp for pacing */
   uint32_t pacing_time_stamp;
   double tsc_time_cursor; /* in ns, tsc time cursor for packet pacing */
+  /* ptp time may onward */
+  uint32_t max_onward_epochs;
 };
 
 struct st_tx_ancillary_session_impl {
@@ -942,7 +953,10 @@ struct st_tx_ancillary_session_impl {
   /* stat */
   rte_atomic32_t st40_stat_frame_cnt;
   int st40_stat_pkt_cnt;
-  uint32_t st40_epoch_mismatch; /* count of frame lower than pacing */
+  /* count of frame not match the epoch */
+  uint32_t stat_epoch_mismatch;
+  uint32_t stat_epoch_drop;
+  uint32_t stat_epoch_onward;
   uint32_t stat_error_user_timestamp;
 };
 
