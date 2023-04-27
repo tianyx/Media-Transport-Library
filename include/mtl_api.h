@@ -5,7 +5,7 @@
 /**
  * @file mtl_api.h
  *
- * This header define the public interfaces of Media Transport Library.
+ * This header define the public interfaces of Intel® Media Transport Library.
  *
  */
 
@@ -58,7 +58,7 @@ extern "C" {
 #define MTL_BIT32(nr) (UINT32_C(1) << (nr))
 
 /**
- * Max length of a DPDK port name
+ * Max length of a DPDK port name and session logical port
  */
 #define MTL_PORT_MAX_LEN (64)
 /**
@@ -74,12 +74,18 @@ extern "C" {
  */
 #define MTL_LITTLE_ENDIAN /* x86 use little endian */
 
+/** Standard mtu size is 1500 */
+#define MTL_MTU_MAX_BYTES (1500)
+
+/** Standard UDP is 1460 bytes, mtu is 1500 */
+#define MTL_UDP_MAX_BYTES (1460)
+
 /**
  * Max bytes in one RTP packet, include payload and header
  * standard UDP is 1460 bytes, and UDP headers are 8 bytes
  * leave 100 for network extra space
  */
-#define MTL_PKT_MAX_RTP_BYTES (1460 - 8 - 100)
+#define MTL_PKT_MAX_RTP_BYTES (MTL_UDP_MAX_BYTES - 8 - 100)
 
 /**
  * Max allowed number of dma devs
@@ -129,7 +135,22 @@ typedef struct mtl_dma_mem* mtl_dma_mem_handle;
 enum mtl_port {
   MTL_PORT_P = 0, /**< primary port */
   MTL_PORT_R,     /**< redundant port */
+  MTL_PORT_2,     /**< port index: 2 */
+  MTL_PORT_3,     /**< port index: 3 */
+  MTL_PORT_4,     /**< port index: 4 */
+  MTL_PORT_5,     /**< port index: 5 */
+  MTL_PORT_6,     /**< port index: 6 */
+  MTL_PORT_7,     /**< port index: 7 */
   MTL_PORT_MAX,   /**< max value of this enum */
+};
+
+/**
+ * Session port logical type
+ */
+enum mtl_session_port {
+  MTL_SESSION_PORT_P = 0, /**< primary session(logical) port */
+  MTL_SESSION_PORT_R,     /**< redundant session(logical) port */
+  MTL_SESSION_PORT_MAX,   /**< max value of this enum */
 };
 
 /**
@@ -154,6 +175,52 @@ enum mtl_pmd_type {
   MTL_PMD_DPDK_AF_XDP,
   /** max value of this enum */
   MTL_PMD_TYPE_MAX,
+};
+
+/**
+ * RSS mode
+ */
+enum mtl_rss_mode {
+  /** not using rss */
+  MTL_RSS_MODE_NONE = 0,
+  /** hash with both l3 src and dst, not use now */
+  MTL_RSS_MODE_L3,
+  /** hash with l3 src and dst address, l4 src port and dst port, used with shared rss */
+  MTL_RSS_MODE_L3_L4,
+  /** hash with l3 src and dst address, l4 dst port only, for st2110 unicast */
+  MTL_RSS_MODE_L3_L4_DP_ONLY,
+  /** hash with l3 dst address only, l4 dst port only, for st2110 multicast */
+  MTL_RSS_MODE_L3_DA_L4_DP_ONLY,
+  /** hash with l4 dst port only, for udp transport */
+  MTL_RSS_MODE_L4_DP_ONLY,
+  /** max value of this enum */
+  MTL_RSS_MODE_MAX,
+};
+
+/**
+ * IOVA mode
+ */
+enum mtl_iova_mode {
+  /** let DPDK to choose IOVA mode */
+  MTL_IOVA_MODE_AUTO = 0,
+  /** using IOVA VA mode */
+  MTL_IOVA_MODE_VA,
+  /** using IOVA PA mode */
+  MTL_IOVA_MODE_PA,
+  /** max value of this enum */
+  MTL_IOVA_MODE_MAX,
+};
+
+/**
+ * Interface network protocol
+ */
+enum mtl_net_proto {
+  /** using static IP configuration */
+  MTL_PROTO_STATIC = 0,
+  /** using DHCP(auto) IP configuration */
+  MTL_PROTO_DHCP,
+  /** max value of this enum */
+  MTL_PROTO_MAX,
 };
 
 /**
@@ -193,6 +260,8 @@ enum st21_tx_pacing_way {
   ST21_TX_PACING_WAY_TSN,
   /** ptp based pacing */
   ST21_TX_PACING_WAY_PTP,
+  /** best effort sending */
+  ST21_TX_PACING_WAY_BE,
   /** Max value of this enum */
   ST21_TX_PACING_WAY_MAX,
 };
@@ -252,6 +321,21 @@ enum st21_tx_pacing_way {
  * Use PI controller for built-in PTP implementation, only for PF now.
  */
 #define MTL_FLAG_PTP_PI (MTL_BIT64(9))
+/**
+ * Flag bit in flags of struct mtl_init_params.
+ * Enable background lcore mode for MTL_TRANSPORT_UDP.
+ */
+#define MTL_FLAG_UDP_LCORE (MTL_BIT64(10))
+/**
+ * Flag bit in flags of struct mtl_init_params.
+ * Enable random source port for MTL_TRANSPORT_ST2110 tx.
+ */
+#define MTL_FLAG_RANDOM_SRC_PORT (MTL_BIT64(11))
+/**
+ * Flag bit in flags of struct mtl_init_params.
+ * Enable multiple source port for MTL_TRANSPORT_ST2110 20 tx.
+ */
+#define MTL_FLAG_MULTI_SRC_PORT (MTL_BIT64(12))
 
 /**
  * Flag bit in flags of struct mtl_init_params, debug usage only.
@@ -309,6 +393,12 @@ enum st21_tx_pacing_way {
  * Force to get ptp time from tsc source.
  */
 #define MTL_FLAG_PTP_SOURCE_TSC (MTL_BIT64(29))
+/**
+ * Flag bit in flags of struct mtl_init_params, debug usage only.
+ * Disable TX chain mbuf, use same mbuf for header and payload.
+ * Will do memcpy from framebuffer to packet payload.
+ */
+#define MTL_FLAG_TX_NO_CHAIN (MTL_BIT64(30))
 
 /**
  * The structure describing how to init af_xdp interface.
@@ -331,7 +421,9 @@ struct mtl_init_params {
   char port[MTL_PORT_MAX][MTL_PORT_MAX_LEN];
   /** number of pcie ports, 1 or 2, mandatory */
   uint8_t num_ports;
-  /** source IP of ports, for MTL_PMD_DPDK_USER */
+  /** bound IP of ports, for MTL_PMD_DPDK_USER
+   * This is not used when DHCP enabled, otherwise set the valid value.
+   */
   uint8_t sip_addr[MTL_PORT_MAX][MTL_IP_ADDR_LEN];
   /** log level */
   enum mtl_log_level log_level;
@@ -341,11 +433,13 @@ struct mtl_init_params {
   enum mtl_transport_type transport;
   /**
    * net mask of ports, for MTL_PMD_DPDK_USER.
+   * This is not used when DHCP enabled, otherwise set the valid value.
    * Lib will use 255.255.255.0 if this value is blank
    */
   uint8_t netmask[MTL_PORT_MAX][MTL_IP_ADDR_LEN];
   /**
-   * gateway of ports, mandatory if need wan support.
+   * default gateway of ports, for MTL_PMD_DPDK_USER.
+   * This is not used when DHCP enabled, otherwise set the valid value.
    * User can use "route -n" to get gateway before bind the port to DPDK PMD.
    * For MTL_PMD_DPDK_AF_XDP, lib will try to fetch gateway by route command
    * if this value is not assigned.
@@ -403,12 +497,14 @@ struct mtl_init_params {
    * if NULL, ST instance will get from built-in ptp source(NIC) or system time instead.
    */
   uint64_t (*ptp_get_time_fn)(void* priv);
-  /** stats dump peroid in seconds, 0 means determined by lib */
+  /** stats dump period in seconds, 0 means determined by lib */
   uint16_t dump_period_s;
-  /** stats dump callabck in every dump_period_s */
+  /** stats dump callback in every dump_period_s */
   void (*stat_dump_cb_fn)(void* priv);
   /** data quota for each lcore, 0 means determined by lib */
   uint32_t data_quota_mbs_per_sch;
+  /** the number of tasklets for each lcore, 0 means determined by lib */
+  uint32_t tasklets_nb_per_sch;
   /**
    * number of transmit descriptors for each NIC TX queue, 0 means determined by lib.
    * It will affect the memory usage and the performance.
@@ -446,6 +542,19 @@ struct mtl_init_params {
    * The ptp pi controller integral gain.
    */
   double ki;
+  /**
+   * Suggest using rss (L3 or L4) for rx packets direction.
+   */
+  enum mtl_rss_mode rss_mode;
+  /**
+   * Select default or force IOVA mode.
+   */
+  enum mtl_iova_mode iova_mode;
+  /**
+   * Interface network protocol
+   * static or DHCP
+   */
+  enum mtl_net_proto net_proto[MTL_PORT_MAX];
 };
 
 /**
@@ -658,7 +767,7 @@ int mtl_sch_set_sleep_us(mtl_handle mt, uint64_t us);
  * @param mt
  *   The handle to the media transport device context.
  * @param lcore
- *   A pointer to the retured lcore number.
+ *   A pointer to the returned lcore number.
  * @return
  *   - 0 if successful.
  *   - <0: Error code if fail.
@@ -671,7 +780,7 @@ int mtl_get_lcore(mtl_handle mt, unsigned int* lcore);
  * @param mt
  *   The handle to the media transport device context.
  * @param thread
- *   the thread wchich request the bind action.
+ *   the thread which request the bind action.
  * @param lcore
  *   the DPDK lcore which requested by mtl_get_lcore.
  * @return
@@ -720,7 +829,7 @@ uint64_t mtl_ptp_read_time(mtl_handle mt);
 /**
  * Allocate memory from the huge-page area of memory. The memory is not cleared.
  * In NUMA systems, the memory allocated from the same NUMA socket of the port.
- * Note the mmeory is mmap to IOVA already, use mtl_hp_virt2iova to get the iova.
+ * Note the memory is mmap to IOVA already, use mtl_hp_virt2iova to get the iova.
  *
  * @param mt
  *   The handle to the media transport device context.
@@ -738,7 +847,7 @@ void* mtl_hp_malloc(mtl_handle mt, size_t size, enum mtl_port port);
  * Allocate zero'ed memory from the huge-page area of memory.
  * Equivalent to mtl_hp_malloc() except that the memory zone is cleared with zero.
  * In NUMA systems, the memory allocated from the same NUMA socket of the port.
- * Note the mmeory is mmap to IOVA already, use mtl_hp_virt2iova to get the iova.
+ * Note the memory is mmap to IOVA already, use mtl_hp_virt2iova to get the iova.
  *
  * @param mt
  *   The handle to the media transport device context.
@@ -1000,6 +1109,26 @@ int mtl_udma_submit(mtl_udma_handle handle);
  *   must be less than or equal to the value of nb_cpls.
  */
 uint16_t mtl_udma_completed(mtl_udma_handle handle, const uint16_t nb_cpls);
+
+/**
+ * Get the rss mode.
+ *
+ * @param mt
+ *   The handle to the media transport device context.
+ * @return
+ *   - enum mtl_rss_mode.
+ */
+enum mtl_rss_mode mtl_rss_mode_get(mtl_handle mt);
+
+/**
+ * Get the iova mode.
+ *
+ * @param mt
+ *   The handle to the media transport device context.
+ * @return
+ *   - enum mtl_iova_mode.
+ */
+enum mtl_iova_mode mtl_iova_mode_get(mtl_handle mt);
 
 /**
  * Get SIMD level current cpu supported.

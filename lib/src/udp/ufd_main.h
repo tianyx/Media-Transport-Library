@@ -9,15 +9,17 @@
 
 /* include "struct sockaddr_in" define before include mudp_sockfd_api */
 // clang-format off
-#include <mudp_sockfd_api.h>
-#include <mudp_sockfd_internal.h>
+#ifdef WINDOWSENV
+#include "mudp_win.h"
+#endif
+#include "mudp_sockfd_api.h"
+#include "mudp_sockfd_internal.h"
 // clang-format on
-
-#define UFD_FD_BASE_DEFAULT (10000)
 
 struct ufd_slot {
   mudp_handle handle;
   int idx;
+  void* opaque;
 };
 
 struct ufd_mt_ctx {

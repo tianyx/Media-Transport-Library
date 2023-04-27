@@ -111,7 +111,7 @@ static inline void ptp_set_master_addr(struct mt_ptp_impl* ptp,
   }
 }
 
-static void ptp_coeffcient_result_reset(struct mt_ptp_impl* ptp) {
+static void ptp_coefficient_result_reset(struct mt_ptp_impl* ptp) {
   ptp->coefficient_result_sum = 0.0;
   ptp->coefficient_result_min = 2.0;
   ptp->coefficient_result_max = 0.0;
@@ -143,7 +143,7 @@ static void ptp_calculate_coefficient(struct mt_ptp_impl* ptp, int64_t delta) {
     ptp->coefficient_result_sum -= ptp->coefficient_result_min;
     ptp->coefficient_result_sum -= ptp->coefficient_result_max;
     ptp->coefficient = ptp->coefficient_result_sum / 8;
-    ptp_coeffcient_result_reset(ptp);
+    ptp_coefficient_result_reset(ptp);
   }
   ptp->last_sync_ts = ts_m;
   dbg("%s(%d), delta %" PRId64 ", co %.15lf, ptp %" PRIu64 "\n", __func__, ptp->port,
@@ -518,8 +518,8 @@ static int ptp_parse_follow_up(struct mt_ptp_impl* ptp,
   return 0;
 }
 
-static int ptp_parse_annouce(struct mt_ptp_impl* ptp, struct mt_ptp_announce_msg* msg,
-                             enum mt_ptp_l_mode mode, struct mt_ptp_ipv4_udp* ipv4_hdr) {
+static int ptp_parse_announce(struct mt_ptp_impl* ptp, struct mt_ptp_announce_msg* msg,
+                              enum mt_ptp_l_mode mode, struct mt_ptp_ipv4_udp* ipv4_hdr) {
   enum mtl_port port = ptp->port;
 
   if (!ptp->master_initialized) {
@@ -692,7 +692,7 @@ static int ptp_init(struct mtl_main_impl* impl, struct mt_ptp_impl* ptp,
   }
 
   ptp_stat_clear(ptp);
-  ptp_coeffcient_result_reset(ptp);
+  ptp_coefficient_result_reset(ptp);
 
   if (!mt_if_has_ptp(impl, port)) {
     if (mt_has_ebu(impl)) {
@@ -796,7 +796,7 @@ int mt_ptp_parse(struct mt_ptp_impl* ptp, struct mt_ptp_header* hdr, bool vlan,
       ptp_parse_delay_resp(ptp, (struct mt_ptp_delay_resp_msg*)hdr);
       break;
     case PTP_ANNOUNCE:
-      ptp_parse_annouce(ptp, (struct mt_ptp_announce_msg*)hdr, mode, ipv4_hdr);
+      ptp_parse_announce(ptp, (struct mt_ptp_announce_msg*)hdr, mode, ipv4_hdr);
       break;
     case PTP_DELAY_REQ:
       break;
@@ -823,6 +823,7 @@ void mt_ptp_stat(struct mtl_main_impl* impl) {
 
   for (int i = 0; i < num_ports; i++) {
     ptp = mt_get_ptp(impl, i);
+    if (!ptp) continue;
 
     ns = mt_get_ptp_time(impl, i);
     mt_ns_to_timespec(ns, &spec);
@@ -877,20 +878,30 @@ void mt_ptp_stat(struct mtl_main_impl* impl) {
 
 int mt_ptp_init(struct mtl_main_impl* impl) {
   int num_ports = mt_num_ports(impl);
+  int socket = mt_socket_id(impl, MTL_PORT_P);
   int ret;
-  struct mt_ptp_impl* ptp;
 
   for (int i = 0; i < num_ports; i++) {
     /* no ptp for kernel based pmd */
     if (mt_pmd_is_kernel(impl, i)) continue;
 
-    ptp = mt_get_ptp(impl, i);
+    struct mt_ptp_impl* ptp = mt_rte_zmalloc_socket(sizeof(*ptp), socket);
+    if (!ptp) {
+      err("%s(%d), ptp malloc fail\n", __func__, i);
+      mt_ptp_uinit(impl);
+      return -ENOMEM;
+    }
+
     ret = ptp_init(impl, ptp, i);
     if (ret < 0) {
       err("%s(%d), ptp_init fail %d\n", __func__, i, ret);
+      mt_rte_free(ptp);
       mt_ptp_uinit(impl);
       return ret;
     }
+
+    /* assign arp instance */
+    impl->ptp[i] = ptp;
   }
 
   return 0;
@@ -902,7 +913,13 @@ int mt_ptp_uinit(struct mtl_main_impl* impl) {
 
   for (int i = 0; i < num_ports; i++) {
     ptp = mt_get_ptp(impl, i);
+    if (!ptp) continue;
+
     ptp_uinit(impl, ptp);
+
+    /* free the memory */
+    mt_rte_free(ptp);
+    impl->ptp[i] = NULL;
   }
 
   return 0;
@@ -912,8 +929,9 @@ uint64_t mt_get_raw_ptp_time(struct mtl_main_impl* impl, enum mtl_port port) {
   return ptp_get_raw_time(mt_get_ptp(impl, port));
 }
 
-uint64_t mt_mbuf_hw_time_stamp(struct mtl_main_impl* impl, struct rte_mbuf* mbuf) {
-  struct mt_ptp_impl* ptp = impl->ptp;
+uint64_t mt_mbuf_hw_time_stamp(struct mtl_main_impl* impl, struct rte_mbuf* mbuf,
+                               enum mtl_port port) {
+  struct mt_ptp_impl* ptp = mt_get_ptp(impl, port);
   uint64_t time_stamp =
       *RTE_MBUF_DYNFIELD(mbuf, impl->dynfield_offset, rte_mbuf_timestamp_t*);
   time_stamp += ptp->ptp_delta;

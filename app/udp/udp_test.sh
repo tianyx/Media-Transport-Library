@@ -19,10 +19,15 @@ SESSIONS_CNT=2
 MUFD_RX_CFG=ufd_server.json
 MUFD_TX_CFG=ufd_client.json
 
+MTL_LD_PRELOAD=/usr/local/lib/x86_64-linux-gnu/libmtl_udp_preload.so
+
 TEST_BIN_PATH=../../build/app
 LOG_LEVEL=notice
 
 export KAHAWAI_CFG_PATH=../../kahawai.json
+
+SHARED_QUEUE=false
+UDP_LCORE=false
 
 test_udp() {
 	local name=$1
@@ -31,10 +36,10 @@ test_udp() {
 	local udp_mode=$4
 
 	echo "${name}: start ${tx_prog}"
-	${TEST_BIN_PATH}/${tx_prog} --log_level ${LOG_LEVEL} --p_port ${ST_PORT_TX} --p_sip ${ST_SIP_TX} --p_tx_ip ${ST_TX_IP} --udp_mode ${udp_mode} --sessions_cnt ${SESSIONS_CNT} &
+	"${TEST_BIN_PATH}"/"${tx_prog}" --log_level "${LOG_LEVEL}" --p_port "${ST_PORT_TX}" --p_sip "${ST_SIP_TX}" --p_tx_ip "${ST_TX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" &
 	pid_tx=$!
 	echo "${name}: start ${rx_prog}"
-	${TEST_BIN_PATH}/${rx_prog} --log_level ${LOG_LEVEL} --p_port ${ST_PORT_RX} --p_sip ${ST_SIP_RX} --p_rx_ip ${ST_RX_IP} --udp_mode ${udp_mode} --sessions_cnt ${SESSIONS_CNT} &
+	"${TEST_BIN_PATH}"/"${rx_prog}" --log_level "${LOG_LEVEL}" --p_port "${ST_PORT_RX}" --p_sip "${ST_SIP_RX}" --p_rx_ip "${ST_RX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" &
 	pid_rx=$!
 	echo "${name}: pid_tx ${pid_tx}, pid_rx ${pid_rx}, wait ${TEST_TIME_SEC}s"
 	sleep ${TEST_TIME_SEC}
@@ -56,11 +61,27 @@ test_ufd() {
 	local rx_prog=$3
 	local udp_mode=$4
 
-	echo "${name}: start ${tx_prog}"
-	MUFD_CFG=${MUFD_TX_CFG} ${TEST_BIN_PATH}/${tx_prog} --log_level ${LOG_LEVEL} --p_tx_ip ${ST_TX_IP} --udp_mode ${udp_mode} --sessions_cnt ${SESSIONS_CNT} &
+	echo "${name}: start ${tx_prog}, shared queue: ${SHARED_QUEUE}, lcore: ${UDP_LCORE}"
+	if [ "$SHARED_QUEUE" == "true" ] && [ "$UDP_LCORE" == "true" ]; then
+		MUFD_CFG="${MUFD_TX_CFG}" "${TEST_BIN_PATH}"/"${tx_prog}" --log_level "${LOG_LEVEL}" --p_tx_ip "${ST_TX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" --shared_queue --udp_lcore &
+	elif [ "$SHARED_QUEUE" == "true" ]; then
+		MUFD_CFG="${MUFD_TX_CFG}" "${TEST_BIN_PATH}"/"${tx_prog}" --log_level "${LOG_LEVEL}" --p_tx_ip "${ST_TX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" --shared_queue &
+	elif [ "$UDP_LCORE" == "true" ]; then
+		MUFD_CFG="${MUFD_TX_CFG}" "${TEST_BIN_PATH}"/"${tx_prog}" --log_level "${LOG_LEVEL}" --p_tx_ip "${ST_TX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" --udp_lcore &
+	else
+		MUFD_CFG="${MUFD_TX_CFG}" "${TEST_BIN_PATH}"/"${tx_prog}" --log_level "${LOG_LEVEL}" --p_tx_ip "${ST_TX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" &
+	fi
 	pid_tx=$!
-	echo "${name}: start ${rx_prog}"
-	MUFD_CFG=${MUFD_RX_CFG} ${TEST_BIN_PATH}/${rx_prog} --log_level ${LOG_LEVEL} --p_rx_ip ${ST_RX_IP} --udp_mode ${udp_mode} --sessions_cnt ${SESSIONS_CNT} &
+	echo "${name}: start ${rx_prog}, shared queue: ${SHARED_QUEUE}, lcore: ${UDP_LCORE}"
+	if [ "$SHARED_QUEUE" == "true" ] && [ "$UDP_LCORE" == "true" ]; then
+		MUFD_CFG="${MUFD_RX_CFG}" "${TEST_BIN_PATH}"/"${rx_prog}" --log_level "${LOG_LEVEL}" --p_rx_ip "${ST_RX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" --shared_queue --udp_lcore &
+	elif [ "$SHARED_QUEUE" == "true" ]; then
+		MUFD_CFG="${MUFD_RX_CFG}" "${TEST_BIN_PATH}"/"${rx_prog}" --log_level "${LOG_LEVEL}" --p_rx_ip "${ST_RX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" --shared_queue &
+	elif [ "$UDP_LCORE" == "true" ]; then
+		MUFD_CFG="${MUFD_RX_CFG}" "${TEST_BIN_PATH}"/"${rx_prog}" --log_level "${LOG_LEVEL}" --p_rx_ip "${ST_RX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" --udp_lcore &
+	else
+		MUFD_CFG="${MUFD_RX_CFG}" "${TEST_BIN_PATH}"/"${rx_prog}" --log_level "${LOG_LEVEL}" --p_rx_ip "${ST_RX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" &
+	fi
 	pid_rx=$!
 	echo "${name}: pid_tx ${pid_tx}, pid_rx ${pid_rx}, wait ${TEST_TIME_SEC}s"
 	sleep ${TEST_TIME_SEC}
@@ -83,10 +104,36 @@ test_ufd_mcast() {
 	local udp_mode=$4
 
 	echo "${name}: start ${tx_prog}"
-	MUFD_CFG=${MUFD_TX_CFG} ${TEST_BIN_PATH}/${tx_prog} --log_level ${LOG_LEVEL} --p_tx_ip ${ST_MCAST_IP} --udp_mode ${udp_mode} --sessions_cnt ${SESSIONS_CNT} &
+	MUFD_CFG="${MUFD_TX_CFG}" "${TEST_BIN_PATH}"/"${tx_prog}" --log_level "${LOG_LEVEL}" --p_tx_ip "${ST_MCAST_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" &
 	pid_tx=$!
 	echo "${name}: start ${rx_prog}"
-	MUFD_CFG=${MUFD_RX_CFG} ${TEST_BIN_PATH}/${rx_prog} --log_level ${LOG_LEVEL} --p_rx_ip ${ST_MCAST_IP} --udp_mode ${udp_mode} --sessions_cnt ${SESSIONS_CNT} &
+	MUFD_CFG="${MUFD_RX_CFG}" "${TEST_BIN_PATH}"/"${rx_prog}" --log_level "${LOG_LEVEL}" --p_rx_ip "${ST_MCAST_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" &
+	pid_rx=$!
+	echo "${name}: pid_tx ${pid_tx}, pid_rx ${pid_rx}, wait ${TEST_TIME_SEC}s"
+	sleep ${TEST_TIME_SEC}
+
+	echo "${name}: wait all thread ending"
+	kill -SIGINT ${pid_tx}
+	kill -SIGINT ${pid_rx}
+	wait ${pid_tx}
+	echo "${name}: ${tx_prog} exit"
+	wait ${pid_rx}
+	echo "${name}: ${rx_prog} exit"
+	echo "${name}: ****** Done ******"
+	echo ""
+}
+
+test_upl() {
+	local name=$1
+	local tx_prog=$2
+	local rx_prog=$3
+	local udp_mode=$4
+
+	echo "${name}: start ${tx_prog}"
+	LD_PRELOAD="${MTL_LD_PRELOAD}" MUFD_CFG="${MUFD_TX_CFG}" "${TEST_BIN_PATH}"/"${tx_prog}" --log_level "${LOG_LEVEL}" --p_sip "${ST_SIP_TX}" --p_tx_ip "${ST_TX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" &
+	pid_tx=$!
+	echo "${name}: start ${rx_prog}"
+	LD_PRELOAD="${MTL_LD_PRELOAD}" MUFD_CFG="${MUFD_RX_CFG}" "${TEST_BIN_PATH}"/"${rx_prog}" --log_level "${LOG_LEVEL}" --p_sip "${ST_SIP_RX}" --p_rx_ip "${ST_RX_IP}" --udp_mode "${udp_mode}" --sessions_cnt "${SESSIONS_CNT}" &
 	pid_rx=$!
 	echo "${name}: pid_tx ${pid_tx}, pid_rx ${pid_rx}, wait ${TEST_TIME_SEC}s"
 	sleep ${TEST_TIME_SEC}
@@ -114,8 +161,40 @@ test_ufd ufd_transport UfdClientSample UfdServerSample transport
 test_ufd ufd_transport_poll UfdClientSample UfdServerSample transport_poll
 test_ufd ufd_transport_unify_poll UfdClientSample UfdServerSample transport_unify_poll
 
+# test ufd shared queue mode
+SHARED_QUEUE=true
+test_ufd ufd_default UfdClientSample UfdServerSample default
+test_ufd ufd_transport UfdClientSample UfdServerSample transport
+test_ufd ufd_transport_poll UfdClientSample UfdServerSample transport_poll
+test_ufd ufd_transport_unify_poll UfdClientSample UfdServerSample transport_unify_poll
+SHARED_QUEUE=false
+
+# test ufd lcore mode
+UDP_LCORE=true
+test_ufd ufd_default UfdClientSample UfdServerSample default
+test_ufd ufd_transport UfdClientSample UfdServerSample transport
+test_ufd ufd_transport_poll UfdClientSample UfdServerSample transport_poll
+test_ufd ufd_transport_unify_poll UfdClientSample UfdServerSample transport_unify_poll
+UDP_LCORE=false
+
+# test ufd shared queue mode and lcore mode
+UDP_LCORE=true
+SHARED_QUEUE=true
+test_ufd ufd_default UfdClientSample UfdServerSample default
+test_ufd ufd_transport UfdClientSample UfdServerSample transport
+test_ufd ufd_transport_poll UfdClientSample UfdServerSample transport_poll
+test_ufd ufd_transport_unify_poll UfdClientSample UfdServerSample transport_unify_poll
+SHARED_QUEUE=false
+UDP_LCORE=false
+
 # test ufd mcast
 test_ufd_mcast ufd_mcast UfdClientSample UfdServerSample transport_poll
+
+# test upl
+test_upl upl_default UsocketClientSample UsocketServerSample default
+test_upl upl_transport UsocketClientSample UsocketServerSample transport
+test_upl upl_transport_poll UsocketClientSample UsocketServerSample transport_poll
+test_upl upl_transport_unify_poll UsocketClientSample UsocketServerSample transport_unify_poll
 
 echo "****** All test OK ******"
 

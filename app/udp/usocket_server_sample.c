@@ -24,6 +24,9 @@ struct usocket_server_sample_ctx {
   int recv_cnt;
   ssize_t recv_len;
   uint64_t last_stat_time;
+
+  int send_cnt_total;
+  int recv_cnt_total;
 };
 
 struct usocket_server_samples_ctx {
@@ -53,6 +56,7 @@ static void* usocket_server_thread(void* arg) {
       continue;
     }
     s->recv_cnt++;
+    s->recv_cnt_total++;
     s->recv_len += recv;
     dbg("%s(%d), recv %d bytes\n", __func__, s->idx, (int)recv);
     ssize_t send =
@@ -62,6 +66,7 @@ static void* usocket_server_thread(void* arg) {
       continue;
     }
     s->send_cnt++;
+    s->send_cnt_total++;
   }
   info("%s(%d), stop\n", __func__, s->idx);
 
@@ -82,6 +87,7 @@ static void* usocket_server_transport_thread(void* arg) {
       continue;
     }
     s->recv_cnt++;
+    s->recv_cnt_total++;
     s->recv_len += recv;
   }
   info("%s(%d), stop\n", __func__, s->idx);
@@ -110,6 +116,7 @@ static void* usocket_server_transport_poll_thread(void* arg) {
       continue;
     }
     s->recv_cnt++;
+    s->recv_cnt_total++;
   }
   info("%s(%d), stop\n", __func__, s->idx);
 
@@ -146,6 +153,7 @@ static void* usocket_servers_poll_thread(void* arg) {
         continue;
       }
       s->recv_cnt++;
+      s->recv_cnt_total++;
       s->recv_len += recv;
     }
   }
@@ -289,33 +297,45 @@ int main(int argc, char** argv) {
     }
   }
 
+  // check result
+  ret = 0;
+  for (int i = 0; i < session_num; i++) {
+    info("%s(%d), recv_cnt_total %d\n", __func__, i, app[i]->recv_cnt_total);
+    if (app[i]->recv_cnt_total <= 0) {
+      ret += -EIO;
+    }
+    if (ctx.udp_mode == SAMPLE_UDP_DEFAULT) {
+      info("%s(%d), send_cnt_total %d\n", __func__, i, app[i]->send_cnt_total);
+      if (app[i]->send_cnt_total <= 0) {
+        ret += -EIO;
+      }
+    }
+  }
+
+error:
   if (ctx.udp_mode == SAMPLE_UDP_TRANSPORT_UNIFY_POLL) {
     ctxs.stop = true;
     dbg("%s(%d), stop ctxs thread\n", __func__, i);
     st_pthread_mutex_lock(&ctxs.wake_mutex);
     st_pthread_cond_signal(&ctxs.wake_cond);
     st_pthread_mutex_unlock(&ctxs.wake_mutex);
-    pthread_join(ctxs.thread, NULL);
-  } else {
-    // stop app thread
-    for (int i = 0; i < session_num; i++) {
-      app[i]->stop = true;
-      dbg("%s(%d), stop thread\n", __func__, i);
-      st_pthread_mutex_lock(&app[i]->wake_mutex);
-      st_pthread_cond_signal(&app[i]->wake_cond);
-      st_pthread_mutex_unlock(&app[i]->wake_mutex);
-      pthread_join(app[i]->thread, NULL);
-    }
+    if (ctxs.thread) pthread_join(ctxs.thread, NULL);
   }
 
-error:
   for (int i = 0; i < session_num; i++) {
-    if (app[i]) {
-      if (app[i]->socket > 0) close(app[i]->socket);
-      st_pthread_mutex_destroy(&app[i]->wake_mutex);
-      st_pthread_cond_destroy(&app[i]->wake_cond);
-      free(app[i]);
-    }
+    if (!app[i]) continue;
+    // stop app thread
+    app[i]->stop = true;
+    dbg("%s(%d), stop thread\n", __func__, i);
+    st_pthread_mutex_lock(&app[i]->wake_mutex);
+    st_pthread_cond_signal(&app[i]->wake_cond);
+    st_pthread_mutex_unlock(&app[i]->wake_mutex);
+    if (app[i]->thread) pthread_join(app[i]->thread, NULL);
+
+    if (app[i]->socket > 0) close(app[i]->socket);
+    st_pthread_mutex_destroy(&app[i]->wake_mutex);
+    st_pthread_cond_destroy(&app[i]->wake_cond);
+    free(app[i]);
   }
   if (ctxs.apps) free(ctxs.apps);
   st_pthread_mutex_destroy(&ctxs.wake_mutex);

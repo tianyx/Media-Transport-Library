@@ -37,7 +37,7 @@ enum st_args_cmd {
   ST22_ARG_TX_SESSIONS_CNT,
   ST22_ARG_TX_URL,
   ST_ARG_RX_VIDEO_SESSIONS_CNT,
-  ST_ARG_RX_VIDEO_FLIE_FRAMES,
+  ST_ARG_RX_VIDEO_FILE_FRAMES,
   ST_ARG_RX_VIDEO_FB_CNT,
   ST_ARG_RX_VIDEO_RTP_RING_SIZE,
   ST_ARG_RX_AUDIO_SESSIONS_CNT,
@@ -90,6 +90,10 @@ enum st_args_cmd {
   ST_ARG_PTP_KP,
   ST_ARG_PTP_KI,
   ST_ARG_PTP_TSC,
+  ST_ARG_RSS_MODE,
+  ST_ARG_RANDOM_SRC_PORT,
+  ST_ARG_TX_NO_CHAIN,
+  ST_ARG_MULTI_SRC_PORT,
   ST_ARG_MAX,
 };
 
@@ -128,7 +132,7 @@ static struct option st_app_args_options[] = {
     {"tx_st22_url", required_argument, 0, ST22_ARG_TX_URL},
 
     {"rx_video_sessions_count", required_argument, 0, ST_ARG_RX_VIDEO_SESSIONS_CNT},
-    {"rx_video_file_frames", required_argument, 0, ST_ARG_RX_VIDEO_FLIE_FRAMES},
+    {"rx_video_file_frames", required_argument, 0, ST_ARG_RX_VIDEO_FILE_FRAMES},
     {"rx_video_fb_cnt", required_argument, 0, ST_ARG_RX_VIDEO_FB_CNT},
     {"rx_video_rtp_ring_size", required_argument, 0, ST_ARG_RX_VIDEO_RTP_RING_SIZE},
     {"rx_audio_sessions_count", required_argument, 0, ST_ARG_RX_AUDIO_SESSIONS_CNT},
@@ -181,6 +185,10 @@ static struct option st_app_args_options[] = {
     {"kp", required_argument, 0, ST_ARG_PTP_KP},
     {"ki", required_argument, 0, ST_ARG_PTP_KI},
     {"ptp_tsc", no_argument, 0, ST_ARG_PTP_TSC},
+    {"rss_mode", required_argument, 0, ST_ARG_RSS_MODE},
+    {"random_src_port", no_argument, 0, ST_ARG_RANDOM_SRC_PORT},
+    {"tx_no_chain", no_argument, 0, ST_ARG_TX_NO_CHAIN},
+    {"multi_src_port", no_argument, 0, ST_ARG_MULTI_SRC_PORT},
 
     {0, 0, 0, 0}};
 
@@ -255,6 +263,7 @@ static int app_args_json(struct st_app_context* ctx, struct mtl_init_params* p,
     memcpy(p->sip_addr[i], ctx->json_ctx->interfaces[i].ip_addr, sizeof(p->sip_addr[i]));
     memcpy(p->netmask[i], ctx->json_ctx->interfaces[i].netmask, sizeof(p->netmask[i]));
     memcpy(p->gateway[i], ctx->json_ctx->interfaces[i].gateway, sizeof(p->gateway[i]));
+    p->net_proto[i] = ctx->json_ctx->interfaces[i].net_proto;
     p->num_ports++;
   }
   if (ctx->json_ctx->sch_quota) {
@@ -344,7 +353,7 @@ int st_app_parse_args(struct st_app_context* ctx, struct mtl_init_params* p, int
       case ST_ARG_RX_VIDEO_SESSIONS_CNT:
         ctx->rx_video_session_cnt = atoi(optarg);
         break;
-      case ST_ARG_RX_VIDEO_FLIE_FRAMES:
+      case ST_ARG_RX_VIDEO_FILE_FRAMES:
         ctx->rx_video_file_frames = atoi(optarg);
         break;
       case ST_ARG_RX_VIDEO_FB_CNT:
@@ -385,6 +394,8 @@ int st_app_parse_args(struct st_app_context* ctx, struct mtl_init_params* p, int
           p->pacing = ST21_TX_PACING_WAY_TSC;
         else if (!strcmp(optarg, "ptp"))
           p->pacing = ST21_TX_PACING_WAY_PTP;
+        else if (!strcmp(optarg, "be"))
+          p->pacing = ST21_TX_PACING_WAY_BE;
         else
           err("%s, unknow pacing way %s\n", __func__, optarg);
         break;
@@ -534,6 +545,31 @@ int st_app_parse_args(struct st_app_context* ctx, struct mtl_init_params* p, int
         break;
       case ST_ARG_PTP_TSC:
         p->flags |= MTL_FLAG_PTP_SOURCE_TSC;
+        break;
+      case ST_ARG_RANDOM_SRC_PORT:
+        p->flags |= MTL_FLAG_RANDOM_SRC_PORT;
+        break;
+      case ST_ARG_RSS_MODE:
+        if (!strcmp(optarg, "l3"))
+          p->rss_mode = MTL_RSS_MODE_L3;
+        else if (!strcmp(optarg, "l3_l4"))
+          p->rss_mode = MTL_RSS_MODE_L3_L4;
+        else if (!strcmp(optarg, "l3_l4_dst_port_only"))
+          p->rss_mode = MTL_RSS_MODE_L3_L4_DP_ONLY;
+        else if (!strcmp(optarg, "l3_da_l4_dst_port_only"))
+          p->rss_mode = MTL_RSS_MODE_L3_DA_L4_DP_ONLY;
+        else if (!strcmp(optarg, "l4_dst_port_only"))
+          p->rss_mode = MTL_RSS_MODE_L4_DP_ONLY;
+        else if (!strcmp(optarg, "none"))
+          p->rss_mode = MTL_RSS_MODE_NONE;
+        else
+          err("%s, unknow rss mode %s\n", __func__, optarg);
+        break;
+      case ST_ARG_TX_NO_CHAIN:
+        p->flags |= MTL_FLAG_TX_NO_CHAIN;
+        break;
+      case ST_ARG_MULTI_SRC_PORT:
+        p->flags |= MTL_FLAG_MULTI_SRC_PORT;
         break;
       case '?':
         break;

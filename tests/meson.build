@@ -6,7 +6,7 @@ project('mtl_test', 'cpp', default_options: ['buildtype=release'],
 
 exec_env = host_machine.system()
 set_variable('is_windows', exec_env == 'windows')
-message('BUILD Enviroment: ' + exec_env)
+message('BUILD Environment: ' + exec_env)
 
 cpp_c = meson.get_compiler('cpp')
 
@@ -30,10 +30,12 @@ test_c_args = []
 test_cpp_args = []
 test_ld_args = []
 
-# enable warning as error
-test_c_args += ['-Werror']
+# enable warning as error for non debug build
+if get_option('buildtype') != 'debug'
+  test_c_args += ['-Werror']
+  test_cpp_args += ['-Werror']
+endif
 test_c_args += ['-Wall']
-test_cpp_args += ['-Werror']
 test_cpp_args += ['-Wall']
 
 if is_windows
@@ -67,5 +69,14 @@ executable('KahawaiUfdTest', ufd_sources,
   cpp_args : test_cpp_args,
   link_args: test_ld_args,
   # asan should be always the first dep
-  dependencies: [asan_dep, mtl, gtest, libnuma, libopenssl, libpthread]
+  dependencies: [asan_dep, mtl, gtest, libopenssl]
+)
+
+# build upl test executable
+executable('KahawaiUplTest', upl_sources,
+  c_args : test_c_args,
+  cpp_args : test_cpp_args,
+  link_args: test_ld_args,
+  # asan should be always the first dep
+  dependencies: [asan_dep, gtest, libopenssl]
 )

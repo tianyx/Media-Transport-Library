@@ -5,7 +5,7 @@
 /**
  * @file st_api.h
  *
- * Interfaces to Media Transport Library for st2110-20/22 transport.
+ * Interfaces for st2110-20/22 transport.
  *
  */
 
@@ -72,7 +72,7 @@ extern "C" {
  */
 #define ST22_TX_FLAG_USER_R_MAC (MTL_BIT32(1))
 /**
- * Flag bit in flags of struct st20_tx_ops.
+ * Flag bit in flags of struct st22_tx_ops.
  * Disable ST22 boxes, for ST22_TYPE_FRAME_LEVEL
  */
 #define ST22_TX_FLAG_DISABLE_BOXES (MTL_BIT32(2))
@@ -96,7 +96,7 @@ extern "C" {
 
 /**
  * Flag bit in flags of struct st20_rx_ops, for non MTL_PMD_DPDK_USER.
- * If set, it's application duty to set the rx flow(queue) and muticast join/drop.
+ * If set, it's application duty to set the rx flow(queue) and multicast join/drop.
  * Use st20_rx_get_queue_meta to get the queue meta(queue number etc) info.
  */
 #define ST20_RX_FLAG_DATA_PATH_ONLY (MTL_BIT32(0))
@@ -145,7 +145,7 @@ extern "C" {
 
 /**
  * Flag bit in flags of struct st22_rx_ops, for non MTL_PMD_DPDK_USER.
- * If set, it's application duty to set the rx flow(queue) and muticast join/drop.
+ * If set, it's application duty to set the rx flow(queue) and multicast join/drop.
  * Use st22_rx_get_queue_meta to get the queue meta(queue number etc) info.
  */
 #define ST22_RX_FLAG_DATA_PATH_ONLY (MTL_BIT32(0))
@@ -154,6 +154,11 @@ extern "C" {
  * If enabled, lib will pass ST_EVENT_VSYNC by the notify_event on every epoch start.
  */
 #define ST22_RX_FLAG_ENABLE_VSYNC (MTL_BIT32(1))
+/**
+ * Flag bit in flags of struct st22_rx_ops.
+ * Disable ST22 boxes, for ST22_TYPE_FRAME_LEVEL
+ */
+#define ST22_RX_FLAG_DISABLE_BOXES (MTL_BIT32(2))
 
 /**
  * Flag bit in flags of struct st22_rx_ops.
@@ -829,7 +834,7 @@ struct st20_ext_frame {
   mtl_iova_t buf_iova;
   /** Length of external framebuffer */
   size_t buf_len;
-  /** Private data for user, will be retrived with st_frame or st20_rx_frame_meta */
+  /** Private data for user, will be retrieved with st_frame or st20_rx_frame_meta */
   void* opaque;
 };
 
@@ -843,13 +848,15 @@ struct st20_tx_ops {
   /** private data to the callback function */
   void* priv;
   /** destination IP address */
-  uint8_t dip_addr[MTL_PORT_MAX][MTL_IP_ADDR_LEN];
+  uint8_t dip_addr[MTL_SESSION_PORT_MAX][MTL_IP_ADDR_LEN];
   /** Pcie BDF path like 0000:af:00.0, should align to BDF of mtl_init */
-  char port[MTL_PORT_MAX][MTL_PORT_MAX_LEN];
+  char port[MTL_SESSION_PORT_MAX][MTL_PORT_MAX_LEN];
   /** 1 or 2, num of ports this session attached to */
   uint8_t num_port;
-  /** UDP port number */
-  uint16_t udp_port[MTL_PORT_MAX];
+  /** UDP source port number, leave as 0 to use same port as dst */
+  uint16_t udp_src_port[MTL_SESSION_PORT_MAX];
+  /** UDP destination port number */
+  uint16_t udp_port[MTL_SESSION_PORT_MAX];
 
   /** Sender pacing type */
   enum st21_pacing pacing;
@@ -880,7 +887,7 @@ struct st20_tx_ops {
    * tx destination mac address.
    * Valid if ST20_TX_FLAG_USER_P(R)_MAC is enabled
    */
-  uint8_t tx_dst_mac[MTL_PORT_MAX][MTL_MAC_ADDR_LEN];
+  uint8_t tx_dst_mac[MTL_SESSION_PORT_MAX][MTL_MAC_ADDR_LEN];
 
   /**
    * the frame buffer count requested for one st20 tx session,
@@ -890,7 +897,7 @@ struct st20_tx_ops {
   uint16_t framebuff_cnt;
   /**
    * ST20_TYPE_FRAME_LEVEL callback when lib require a new frame.
-   * User should provide the next avaiable frame index to next_frame_idx.
+   * User should provide the next available frame index to next_frame_idx.
    * It implicit means the frame ownership will be transferred to lib.
    * only for ST20_TYPE_FRAME_LEVEL.
    * And only non-block method can be used within this callback, as it run from lcore
@@ -958,13 +965,15 @@ struct st22_tx_ops {
   /** private data to the callback function */
   void* priv;
   /** destination IP address */
-  uint8_t dip_addr[MTL_PORT_MAX][MTL_IP_ADDR_LEN];
+  uint8_t dip_addr[MTL_SESSION_PORT_MAX][MTL_IP_ADDR_LEN];
   /** Pcie BDF path like 0000:af:00.0, should align to BDF of mtl_init */
-  char port[MTL_PORT_MAX][MTL_PORT_MAX_LEN];
+  char port[MTL_SESSION_PORT_MAX][MTL_PORT_MAX_LEN];
   /** 1 or 2, num of ports this session attached to */
   uint8_t num_port;
-  /** UDP port number */
-  uint16_t udp_port[MTL_PORT_MAX];
+  /** UDP source port number, leave as 0 to use same port as dst */
+  uint16_t udp_src_port[MTL_SESSION_PORT_MAX];
+  /** UDP destination port number */
+  uint16_t udp_port[MTL_SESSION_PORT_MAX];
 
   /** Session streaming type, frame or RTP */
   enum st22_type type;
@@ -987,7 +996,7 @@ struct st22_tx_ops {
    * tx destination mac address.
    * Valid if ST22_TX_FLAG_USER_P(R)_MAC is enabled
    */
-  uint8_t tx_dst_mac[MTL_PORT_MAX][MTL_MAC_ADDR_LEN];
+  uint8_t tx_dst_mac[MTL_SESSION_PORT_MAX][MTL_MAC_ADDR_LEN];
 
   /**
    * the frame buffer count requested for one st22 tx session,
@@ -1005,7 +1014,7 @@ struct st22_tx_ops {
   size_t framebuff_max_size;
   /**
    * ST22_TYPE_FRAME_LEVEL callback when lib require a new frame.
-   * User should provide the next avaiable frame index to next_frame_idx.
+   * User should provide the next available frame index to next_frame_idx.
    * It implicit means the frame ownership will be transferred to lib.
    * only for ST22_TYPE_FRAME_LEVEL.
    * And only non-block method can be used within this callback, as it run from lcore
@@ -1075,7 +1084,7 @@ struct st20_detect_meta {
 struct st20_detect_reply {
   /**
    * Only for ST20_TYPE_SLICE_LEVEL.
-   * App replied slice lines when sliceused.
+   * App replied slice lines when slice used.
    */
   uint32_t slice_lines;
   /**
@@ -1095,13 +1104,15 @@ struct st20_rx_ops {
   /** private data to the callback function */
   void* priv;
   /** source IP address of sender */
-  uint8_t sip_addr[MTL_PORT_MAX][MTL_IP_ADDR_LEN];
+  uint8_t sip_addr[MTL_SESSION_PORT_MAX][MTL_IP_ADDR_LEN];
   /** 1 or 2, num of ports this session attached to */
   uint8_t num_port;
   /** Pcie BDF path like 0000:af:00.0, should align to BDF of mtl_init */
-  char port[MTL_PORT_MAX][MTL_PORT_MAX_LEN];
-  /** UDP port number */
-  uint16_t udp_port[MTL_PORT_MAX];
+  char port[MTL_SESSION_PORT_MAX][MTL_PORT_MAX_LEN];
+  /** UDP source port number, leave as 0 to use same port as dst */
+  uint16_t udp_src_port[MTL_SESSION_PORT_MAX];
+  /** UDP destination port number */
+  uint16_t udp_port[MTL_SESSION_PORT_MAX];
 
   /** Sender pacing type */
   enum st21_pacing pacing;
@@ -1147,7 +1158,7 @@ struct st20_rx_ops {
    * return:
    *   - 0: if app consume the frame successful. App should call st20_rx_put_framebuff
    * to return the frame when it finish the handling
-   *   < 0: the error code if app cann't handle, lib will free the frame then.
+   *   < 0: the error code if app can't handle, lib will free the frame then.
    * Only for ST20_TYPE_FRAME_LEVEL/ST20_TYPE_SLICE_LEVEL.
    * And only non-block method can be used in this callback as it run from lcore tasklet
    * routine.
@@ -1164,12 +1175,12 @@ struct st20_rx_ops {
    */
   size_t uframe_size;
   /**
-   * User frame callback when lib receive pixel group datas from network.
+   * User frame callback when lib receive pixel group data from network.
    * frame: point to the address of the user frame buf.
    * meta: point to the meta data.
    * return:
    *   - 0: if app consume the pixel group successfully.
-   *   < 0: the error code if app cann't handle.
+   *   < 0: the error code if app can't handle.
    * Only for ST20_TYPE_FRAME_LEVEL/ST20_TYPE_SLICE_LEVEL.
    * And only non-block method can be used in this callback as it run from lcore tasklet
    * routine.
@@ -1235,13 +1246,15 @@ struct st22_rx_ops {
   /** private data to the callback function */
   void* priv;
   /** source IP address of sender */
-  uint8_t sip_addr[MTL_PORT_MAX][MTL_IP_ADDR_LEN];
+  uint8_t sip_addr[MTL_SESSION_PORT_MAX][MTL_IP_ADDR_LEN];
   /** 1 or 2, num of ports this session attached to */
   uint8_t num_port;
   /** Pcie BDF path like 0000:af:00.0, should align to BDF of mtl_init */
-  char port[MTL_PORT_MAX][MTL_PORT_MAX_LEN];
-  /** UDP port number */
-  uint16_t udp_port[MTL_PORT_MAX];
+  char port[MTL_SESSION_PORT_MAX][MTL_PORT_MAX_LEN];
+  /** UDP source port number, leave as 0 to use same port as dst */
+  uint16_t udp_src_port[MTL_SESSION_PORT_MAX];
+  /** UDP destination port number */
+  uint16_t udp_port[MTL_SESSION_PORT_MAX];
   /** flags, value in ST22_RX_FLAG_* */
   uint32_t flags;
 
@@ -1282,7 +1295,7 @@ struct st22_rx_ops {
    * return:
    *   - 0: if app consume the frame successful. App should call st22_rx_put_framebuff
    * to return the frame when it finish the handling
-   *   < 0: the error code if app cann't handle, lib will free the frame then.
+   *   < 0: the error code if app can't handle, lib will free the frame then.
    * Only for ST22_TYPE_FRAME_LEVEL.
    * And only non-block method can be used in this callback as it run from lcore tasklet
    * routine.
@@ -1393,7 +1406,7 @@ int st20_tx_get_framebuffer_count(st20_tx_handle handle);
  * @param usrptr
  *   *usrptr will be point to the user data(rtp) area inside the mbuf.
  * @return
- *   - NULL if no avaiable mbuf in the ring.
+ *   - NULL if no available mbuf in the ring.
  *   - Otherwise, the dpdk mbuf pointer.
  */
 void* st20_tx_get_mbuf(st20_tx_handle handle, void** usrptr);
@@ -1518,7 +1531,7 @@ int st22_tx_free(st22_tx_handle handle);
  * @param usrptr
  *   *usrptr will be point to the user data(rtp) area inside the mbuf.
  * @return
- *   - NULL if no avaiable mbuf in the ring.
+ *   - NULL if no available mbuf in the ring.
  *   - Otherwise, the dpdk mbuf pointer.
  */
 void* st22_tx_get_mbuf(st22_tx_handle handle, void** usrptr);
@@ -1607,7 +1620,7 @@ int st20_rx_get_sch_idx(st20_rx_handle handle);
  * @param handle
  *   The handle to the rx st2110-20(video) session.
  * @param max_dump_packets
- *   The max number of packets to be dumpped.
+ *   The max number of packets to be dumped.
  * @param sync
  *   synchronous or asynchronous, true means this func will return after dump
  * progress is finished.
@@ -1677,7 +1690,7 @@ int st20_rx_put_framebuff(st20_rx_handle handle, void* frame);
  * @param len
  *   The length of the rtp packet, include both the header and payload.
  * @return
- *   - NULL if no avaiable mbuf in the ring.
+ *   - NULL if no available mbuf in the ring.
  *   - Otherwise, the dpdk mbuf pointer.
  */
 void* st20_rx_get_mbuf(st20_rx_handle handle, void** usrptr, uint16_t* len);
@@ -1707,7 +1720,7 @@ void st20_rx_put_mbuf(st20_rx_handle handle, void* mbuf);
 int st20_rx_get_queue_meta(st20_rx_handle handle, struct st_queue_meta* meta);
 
 /**
- * Check if dma is enabeld or not.
+ * Check if dma is enabled or not.
  *
  * @param handle
  *   The handle to the rx st2110-20(video) session.
@@ -1761,7 +1774,7 @@ int st22_rx_get_sch_idx(st22_rx_handle handle);
  * @param handle
  *   The handle to the rx st2110-22(compressed video) session.
  * @param max_dump_packets
- *   The max number of packets to be dumpped.
+ *   The max number of packets to be dumped.
  * @param sync
  *   synchronous or asynchronous, true means this func will return after dump
  * progress is finished.
@@ -1797,7 +1810,7 @@ int st22_rx_free(st22_rx_handle handle);
  * @param len
  *   The length of the rtp packet, include both the header and payload.
  * @return
- *   - NULL if no avaiable mbuf in the ring.
+ *   - NULL if no available mbuf in the ring.
  *   - Otherwise, the dpdk mbuf pointer.
  */
 void* st22_rx_get_mbuf(st22_rx_handle handle, void** usrptr, uint16_t* len);

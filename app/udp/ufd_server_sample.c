@@ -6,6 +6,9 @@
 
 /* include "struct sockaddr_in" define before include mudp_sockfd_api */
 // clang-format off
+#ifdef WINDOWSENV
+#include <mtl/mudp_win.h>
+#endif
 #include <mtl/mudp_sockfd_api.h>
 // clang-format on
 
@@ -191,23 +194,12 @@ int main(int argc, char** argv) {
   struct st_sample_context ctx;
   struct ufd_server_samples_ctx ctxs;
   int ret;
-  struct mufd_override_params override;
-  bool has_override = false;
 
   memset(&ctx, 0, sizeof(ctx));
   ret = sample_parse_args(&ctx, argc, argv, false, true, true);
   if (ret < 0) return ret;
 
-  memset(&override, 0, sizeof(override));
-  override.log_level = MTL_LOG_LEVEL_INFO;
-  /* check if user has assigned log level */
-  if (ctx.param.log_level != MTL_LOG_LEVEL_INFO) {
-    has_override = true;
-    override.log_level = ctx.param.log_level;
-  }
-  if (has_override) {
-    mufd_commit_override_params(&override);
-  }
+  ufd_override_check(&ctx);
 
   ctx.sig_handler = ufd_server_sig_handler;
 
@@ -325,25 +317,6 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (ctx.udp_mode == SAMPLE_UDP_TRANSPORT_UNIFY_POLL) {
-    ctxs.stop = true;
-    dbg("%s(%d), stop ctxs thread\n", __func__, i);
-    st_pthread_mutex_lock(&ctxs.wake_mutex);
-    st_pthread_cond_signal(&ctxs.wake_cond);
-    st_pthread_mutex_unlock(&ctxs.wake_mutex);
-    pthread_join(ctxs.thread, NULL);
-  } else {
-    // stop app thread
-    for (int i = 0; i < session_num; i++) {
-      app[i]->stop = true;
-      dbg("%s(%d), stop thread\n", __func__, i);
-      st_pthread_mutex_lock(&app[i]->wake_mutex);
-      st_pthread_cond_signal(&app[i]->wake_cond);
-      st_pthread_mutex_unlock(&app[i]->wake_mutex);
-      pthread_join(app[i]->thread, NULL);
-    }
-  }
-
   // check result
   ret = 0;
   for (int i = 0; i < session_num; i++) {
@@ -360,27 +333,43 @@ int main(int argc, char** argv) {
   }
 
 error:
+  if (ctx.udp_mode == SAMPLE_UDP_TRANSPORT_UNIFY_POLL) {
+    ctxs.stop = true;
+    dbg("%s(%d), stop ctxs thread\n", __func__, i);
+    st_pthread_mutex_lock(&ctxs.wake_mutex);
+    st_pthread_cond_signal(&ctxs.wake_cond);
+    st_pthread_mutex_unlock(&ctxs.wake_mutex);
+    if (ctxs.thread) pthread_join(ctxs.thread, NULL);
+  }
+
   for (int i = 0; i < session_num; i++) {
-    if (app[i]) {
-      if (app[i]->socket >= 0) {
-        bool mcast = mudp_is_multicast(&app[i]->client_addr);
-        if (mcast) {
-          struct ip_mreq mreq;
-          memset(&mreq, 0, sizeof(mreq));
-          /* multicast addr */
-          mreq.imr_multiaddr.s_addr = app[i]->client_addr.sin_addr.s_addr;
-          /* local nic src ip */
-          memcpy(&mreq.imr_interface.s_addr, ctx.param.sip_addr[MTL_PORT_P],
-                 MTL_IP_ADDR_LEN);
-          mufd_setsockopt(app[i]->socket, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq,
-                          sizeof(mreq));
-        }
-        mufd_close(app[i]->socket);
+    if (!app[i]) continue;
+    // stop app thread
+    app[i]->stop = true;
+    dbg("%s(%d), stop thread\n", __func__, i);
+    st_pthread_mutex_lock(&app[i]->wake_mutex);
+    st_pthread_cond_signal(&app[i]->wake_cond);
+    st_pthread_mutex_unlock(&app[i]->wake_mutex);
+    if (app[i]->thread) pthread_join(app[i]->thread, NULL);
+
+    if (app[i]->socket >= 0) {
+      bool mcast = mudp_is_multicast(&app[i]->client_addr);
+      if (mcast) {
+        struct ip_mreq mreq;
+        memset(&mreq, 0, sizeof(mreq));
+        /* multicast addr */
+        mreq.imr_multiaddr.s_addr = app[i]->client_addr.sin_addr.s_addr;
+        /* local nic src ip */
+        memcpy(&mreq.imr_interface.s_addr, ctx.param.sip_addr[MTL_PORT_P],
+               MTL_IP_ADDR_LEN);
+        mufd_setsockopt(app[i]->socket, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq,
+                        sizeof(mreq));
       }
-      st_pthread_mutex_destroy(&app[i]->wake_mutex);
-      st_pthread_cond_destroy(&app[i]->wake_cond);
-      free(app[i]);
+      mufd_close(app[i]->socket);
     }
+    st_pthread_mutex_destroy(&app[i]->wake_mutex);
+    st_pthread_cond_destroy(&app[i]->wake_cond);
+    free(app[i]);
   }
   if (ctxs.apps) free(ctxs.apps);
   st_pthread_mutex_destroy(&ctxs.wake_mutex);

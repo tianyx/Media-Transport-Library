@@ -83,8 +83,8 @@ static int app_tx_video_frame_done(void* priv, uint16_t frame_idx,
   st_pthread_mutex_unlock(&s->st20_wake_mutex);
 
   s->st20_frame_done_cnt++;
-  if (!s->stat_frame_frist_tx_time)
-    s->stat_frame_frist_tx_time = st_app_get_monotonic_time();
+  if (!s->stat_frame_first_tx_time)
+    s->stat_frame_first_tx_time = st_app_get_monotonic_time();
 
   return ret;
 }
@@ -456,8 +456,8 @@ static int app_tx_video_build_rtp_packet(struct st_app_tx_video_session* s,
     s->st20_pkt_idx = 0;
     s->st20_rtp_tmstamp++;
     s->st20_frame_done_cnt++;
-    if (!s->stat_frame_frist_tx_time)
-      s->stat_frame_frist_tx_time = st_app_get_monotonic_time();
+    if (!s->stat_frame_first_tx_time)
+      s->stat_frame_first_tx_time = st_app_get_monotonic_time();
     int frame_size = s->interlaced ? s->st20_frame_size * 2 : s->st20_frame_size;
     if (!s->interlaced) {
       s->st20_frame_cursor += frame_size;
@@ -649,7 +649,7 @@ static int app_tx_video_uinit(struct st_app_tx_video_session* s) {
 static int app_tx_video_result(struct st_app_tx_video_session* s) {
   int idx = s->idx;
   uint64_t cur_time_ns = st_app_get_monotonic_time();
-  double time_sec = (double)(cur_time_ns - s->stat_frame_frist_tx_time) / NS_PER_S;
+  double time_sec = (double)(cur_time_ns - s->stat_frame_first_tx_time) / NS_PER_S;
   double framerate = s->st20_frame_done_cnt / time_sec;
 
   if (!s->st20_frame_done_cnt) return -EINVAL;
@@ -676,27 +676,29 @@ static int app_tx_video_init(struct st_app_context* ctx, st_json_video_session_t
   ops.name = name;
   ops.priv = s;
   ops.num_port = video ? video->base.num_inf : ctx->para.num_ports;
-  memcpy(ops.dip_addr[MTL_PORT_P],
-         video ? video->base.ip[MTL_PORT_P] : ctx->tx_dip_addr[MTL_PORT_P],
+  memcpy(ops.dip_addr[MTL_SESSION_PORT_P],
+         video ? video->base.ip[MTL_SESSION_PORT_P] : ctx->tx_dip_addr[MTL_PORT_P],
          MTL_IP_ADDR_LEN);
-  strncpy(ops.port[MTL_PORT_P],
-          video ? video->base.inf[MTL_PORT_P]->name : ctx->para.port[MTL_PORT_P],
+  strncpy(ops.port[MTL_SESSION_PORT_P],
+          video ? video->base.inf[MTL_SESSION_PORT_P]->name : ctx->para.port[MTL_PORT_P],
           MTL_PORT_MAX_LEN);
-  ops.udp_port[MTL_PORT_P] = video ? video->base.udp_port : (10000 + s->idx);
+  ops.udp_port[MTL_SESSION_PORT_P] = video ? video->base.udp_port : (10000 + s->idx);
   if (ctx->has_tx_dst_mac[MTL_PORT_P]) {
-    memcpy(&ops.tx_dst_mac[MTL_PORT_P][0], ctx->tx_dst_mac[MTL_PORT_P], MTL_MAC_ADDR_LEN);
+    memcpy(&ops.tx_dst_mac[MTL_SESSION_PORT_P][0], ctx->tx_dst_mac[MTL_PORT_P],
+           MTL_MAC_ADDR_LEN);
     ops.flags |= ST20_TX_FLAG_USER_P_MAC;
   }
   if (ops.num_port > 1) {
-    memcpy(ops.dip_addr[MTL_PORT_R],
-           video ? video->base.ip[MTL_PORT_R] : ctx->tx_dip_addr[MTL_PORT_R],
+    memcpy(ops.dip_addr[MTL_SESSION_PORT_R],
+           video ? video->base.ip[MTL_SESSION_PORT_R] : ctx->tx_dip_addr[MTL_PORT_R],
            MTL_IP_ADDR_LEN);
-    strncpy(ops.port[MTL_PORT_R],
-            video ? video->base.inf[MTL_PORT_R]->name : ctx->para.port[MTL_PORT_R],
-            MTL_PORT_MAX_LEN);
-    ops.udp_port[MTL_PORT_R] = video ? video->base.udp_port : (10000 + s->idx);
+    strncpy(
+        ops.port[MTL_SESSION_PORT_R],
+        video ? video->base.inf[MTL_SESSION_PORT_R]->name : ctx->para.port[MTL_PORT_R],
+        MTL_PORT_MAX_LEN);
+    ops.udp_port[MTL_SESSION_PORT_R] = video ? video->base.udp_port : (10000 + s->idx);
     if (ctx->has_tx_dst_mac[MTL_PORT_R]) {
-      memcpy(&ops.tx_dst_mac[MTL_PORT_R][0], ctx->tx_dst_mac[MTL_PORT_R],
+      memcpy(&ops.tx_dst_mac[MTL_SESSION_PORT_R][0], ctx->tx_dst_mac[MTL_PORT_R],
              MTL_MAC_ADDR_LEN);
       ops.flags |= ST20_TX_FLAG_USER_R_MAC;
     }

@@ -19,6 +19,19 @@ struct loop_para {
   bool use_poll;
 };
 
+static bool loop_dedicated_mode(struct utest_ctx* ctx) {
+  struct mtl_init_params* p = &ctx->init_params.mt_params;
+
+  if (p->flags & MTL_FLAG_SHARED_QUEUE) {
+    return false;
+  }
+  if (p->rss_mode != MTL_RSS_MODE_NONE) {
+    return false;
+  }
+
+  return true;
+}
+
 static int loop_para_init(struct loop_para* para) {
   memset(para, 0x0, sizeof(*para));
   para->sessions = 1;
@@ -45,6 +58,8 @@ static int loop_sanity_test(struct utest_ctx* ctx, struct loop_para* para) {
   int rx_timeout[sessions];
   struct sockaddr_in tx_addr[sessions];
   struct sockaddr_in rx_addr[sessions];
+  struct sockaddr_in tx_bind_addr[sessions]; /* for dual loop */
+  struct sockaddr_in rx_bind_addr[sessions];
   struct pollfd fds[sessions];
   int ret;
   struct mtl_init_params* p = &ctx->init_params.mt_params;
@@ -63,9 +78,13 @@ static int loop_sanity_test(struct utest_ctx* ctx, struct loop_para* para) {
     if (para->mcast) {
       mufd_init_sockaddr(&tx_addr[i], ctx->mcast_ip_addr, udp_port + i);
       mufd_init_sockaddr(&rx_addr[i], ctx->mcast_ip_addr, udp_port + i);
+      mufd_init_sockaddr_any(&tx_bind_addr[i], udp_port + i);
+      mufd_init_sockaddr_any(&rx_bind_addr[i], udp_port + i);
     } else {
       mufd_init_sockaddr(&tx_addr[i], p->sip_addr[MTL_PORT_P], udp_port + i);
       mufd_init_sockaddr(&rx_addr[i], p->sip_addr[MTL_PORT_R], udp_port + i);
+      mufd_init_sockaddr(&tx_bind_addr[i], p->sip_addr[MTL_PORT_P], udp_port + i);
+      mufd_init_sockaddr(&rx_bind_addr[i], p->sip_addr[MTL_PORT_R], udp_port + i);
     }
   }
 
@@ -76,7 +95,8 @@ static int loop_sanity_test(struct utest_ctx* ctx, struct loop_para* para) {
     tx_fds[i] = ret;
 
     if (dual_loop) {
-      ret = mufd_bind(tx_fds[i], (const struct sockaddr*)&tx_addr[i], sizeof(tx_addr[i]));
+      ret = mufd_bind(tx_fds[i], (const struct sockaddr*)&tx_bind_addr[i],
+                      sizeof(tx_bind_addr[i]));
       EXPECT_GE(ret, 0);
       if (ret < 0) goto exit;
 
@@ -93,7 +113,8 @@ static int loop_sanity_test(struct utest_ctx* ctx, struct loop_para* para) {
     if (ret < 0) goto exit;
     rx_fds[i] = ret;
 
-    ret = mufd_bind(rx_fds[i], (const struct sockaddr*)&rx_addr[i], sizeof(rx_addr[i]));
+    ret = mufd_bind(rx_fds[i], (const struct sockaddr*)&rx_bind_addr[i],
+                    sizeof(rx_bind_addr[i]));
     EXPECT_GE(ret, 0);
     if (ret < 0) goto exit;
 
@@ -267,8 +288,8 @@ TEST(Loop, multi_shared_max) {
   struct utest_ctx* ctx = utest_get_ctx();
   struct loop_para para;
 
-  if (!(ctx->init_params.mt_params.flags & MTL_FLAG_SHARED_QUEUE)) {
-    err("%s, skip as it's not shared mode\n", __func__);
+  if (loop_dedicated_mode(ctx)) {
+    info("%s, skip as it's dedicated queue mode\n", __func__);
     return;
   }
 
@@ -315,8 +336,8 @@ TEST(Loop, poll_shared_max) {
   struct utest_ctx* ctx = utest_get_ctx();
   struct loop_para para;
 
-  if (!(ctx->init_params.mt_params.flags & MTL_FLAG_SHARED_QUEUE)) {
-    err("%s, skip as it's not shared mode\n", __func__);
+  if (loop_dedicated_mode(ctx)) {
+    info("%s, skip as it's dedicated queue mode\n", __func__);
     return;
   }
 
@@ -364,8 +385,8 @@ TEST(Loop, dual_multi_shared_max) {
   struct utest_ctx* ctx = utest_get_ctx();
   struct loop_para para;
 
-  if (!(ctx->init_params.mt_params.flags & MTL_FLAG_SHARED_QUEUE)) {
-    err("%s, skip as it's not shared mode\n", __func__);
+  if (loop_dedicated_mode(ctx)) {
+    info("%s, skip as it's dedicated queue mode\n", __func__);
     return;
   }
 
@@ -402,8 +423,8 @@ TEST(Loop, mcast_multi_shared_max) {
   struct utest_ctx* ctx = utest_get_ctx();
   struct loop_para para;
 
-  if (!(ctx->init_params.mt_params.flags & MTL_FLAG_SHARED_QUEUE)) {
-    err("%s, skip as it's not shared mode\n", __func__);
+  if (loop_dedicated_mode(ctx)) {
+    info("%s, skip as it's dedicated queue mode\n", __func__);
     return;
   }
 

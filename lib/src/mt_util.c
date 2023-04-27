@@ -591,6 +591,12 @@ int st_frame_trans_uinit(struct st_frame_trans* frame) {
   }
   frame->iova = 0;
 
+  if (frame->page_table) {
+    mt_free(frame->page_table);
+    frame->page_table = NULL;
+    frame->page_table_len = 0;
+  }
+
   return 0;
 }
 
@@ -604,4 +610,21 @@ int st_vsync_calculate(struct mtl_main_impl* impl, struct st_vsync_info* vsync) 
 
   dbg("%s, to_next_epochs %fms\n", __func__, (float)to_next_epochs / NS_PER_MS);
   return 0;
+}
+
+uint16_t mt_random_port(uint16_t base_port) {
+  uint16_t port = base_port;
+
+  srand(mt_get_monotonic_time());
+  uint8_t r = rand() & 0xFF;
+
+  /* todo: random generation with awareness of other sessions */
+  if (r & 0x80) {
+    r &= 0x7F;
+    port -= r;
+  } else {
+    port += r;
+  }
+
+  return port;
 }

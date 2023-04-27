@@ -26,6 +26,9 @@ struct usocket_client_sample_ctx {
   int recv_fail_cnt;
   int recv_err_cnt;
   uint64_t last_stat_time;
+
+  int send_cnt_total;
+  int recv_cnt_total;
 };
 
 static void* usocket_client_thread(void* arg) {
@@ -53,6 +56,7 @@ static void* usocket_client_thread(void* arg) {
       continue;
     }
     s->send_cnt++;
+    s->send_cnt_total++;
 
     ssize_t recv = recvfrom(socket, recv_buf, sizeof(recv_buf), 0, NULL, NULL);
     if (recv != udp_len) {
@@ -71,6 +75,7 @@ static void* usocket_client_thread(void* arg) {
     }
     dbg("%s(%d), recv reply %d bytes succ\n", __func__, s->idx, (int)udp_len);
     s->recv_cnt++;
+    s->recv_cnt_total++;
   }
   info("%s(%d), stop\n", __func__, s->idx);
 
@@ -97,6 +102,7 @@ static void* usocket_client_transport_thread(void* arg) {
       continue;
     }
     s->send_cnt++;
+    s->send_cnt_total++;
   }
   info("%s(%d), stop\n", __func__, s->idx);
 
@@ -198,23 +204,35 @@ int main(int argc, char** argv) {
     }
   }
 
-  // stop app thread
+  // check result
+  ret = 0;
   for (int i = 0; i < session_num; i++) {
-    app[i]->stop = true;
-    st_pthread_mutex_lock(&app[i]->wake_mutex);
-    st_pthread_cond_signal(&app[i]->wake_cond);
-    st_pthread_mutex_unlock(&app[i]->wake_mutex);
-    pthread_join(app[i]->thread, NULL);
+    info("%s(%d), send_cnt_total %d\n", __func__, i, app[i]->send_cnt_total);
+    if (app[i]->send_cnt_total <= 0) {
+      ret += -EIO;
+    }
+    if (ctx.udp_mode == SAMPLE_UDP_DEFAULT) {
+      info("%s(%d), recv_cnt_total %d\n", __func__, i, app[i]->recv_cnt_total);
+      if (app[i]->recv_cnt_total <= 0) {
+        ret += -EIO;
+      }
+    }
   }
 
 error:
   for (int i = 0; i < session_num; i++) {
-    if (app[i]) {
-      if (app[i]->socket) close(app[i]->socket);
-      st_pthread_mutex_destroy(&app[i]->wake_mutex);
-      st_pthread_cond_destroy(&app[i]->wake_cond);
-      free(app[i]);
-    }
+    if (!app[i]) continue;
+    // stop app thread
+    app[i]->stop = true;
+    st_pthread_mutex_lock(&app[i]->wake_mutex);
+    st_pthread_cond_signal(&app[i]->wake_cond);
+    st_pthread_mutex_unlock(&app[i]->wake_mutex);
+    if (app[i]->thread) pthread_join(app[i]->thread, NULL);
+
+    if (app[i]->socket) close(app[i]->socket);
+    st_pthread_mutex_destroy(&app[i]->wake_mutex);
+    st_pthread_cond_destroy(&app[i]->wake_cond);
+    free(app[i]);
   }
 
   return ret;

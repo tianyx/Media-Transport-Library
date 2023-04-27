@@ -32,19 +32,19 @@ static inline void pacing_set_mbuf_time_stamp(struct rte_mbuf* mbuf,
   st_tx_mbuf_set_ptp(mbuf, pacing->ptp_time_cursor);
 }
 
-static inline void pacing_foward_cursor(struct st_tx_video_pacing* pacing) {
-  /* pkt foward */
+static inline void pacing_forward_cursor(struct st_tx_video_pacing* pacing) {
+  /* pkt forward */
   pacing->tsc_time_cursor += pacing->trs;
   pacing->ptp_time_cursor += pacing->trs;
 }
 
 static inline uint64_t tv_rl_bps(struct st_tx_video_session_impl* s) {
-  double ractive = 1.0;
+  double reactive = 1.0;
   if (s->ops.interlaced && s->ops.height <= 576) {
-    ractive = (s->ops.height == 480) ? 487.0 / 525.0 : 576.0 / 625.0;
+    reactive = (s->ops.height == 480) ? 487.0 / 525.0 : 576.0 / 625.0;
   }
   return (uint64_t)(s->st20_pkt_size * s->st20_total_pkts * 1.0 * s->fps_tm.mul /
-                    s->fps_tm.den / ractive);
+                    s->fps_tm.den / reactive);
 }
 
 static void tv_notify_frame_done(struct st_tx_video_session_impl* s, uint16_t frame_idx) {
@@ -79,9 +79,76 @@ static void tv_frame_free_cb(void* addr, void* opaque) {
   dbg("%s(%d), succ frame_idx %d\n", __func__, s_idx, frame_idx);
 }
 
+static rte_iova_t tv_frame_get_offset_iova(struct st_tx_video_session_impl* s,
+                                           struct st_frame_trans* frame_info,
+                                           size_t offset) {
+  if (frame_info->page_table_len == 0) return frame_info->iova + offset;
+  void* addr = RTE_PTR_ADD(frame_info->addr, offset);
+  struct st_page_info* page;
+  for (uint16_t i = 0; i < frame_info->page_table_len; i++) {
+    page = &frame_info->page_table[i];
+    if (addr >= page->addr && addr < RTE_PTR_ADD(page->addr, page->len))
+      return page->iova + RTE_PTR_DIFF(addr, page->addr);
+  }
+
+  err("%s(%d,%d), offset %" PRIu64 " get iova fail\n", __func__, s->idx, frame_info->idx,
+      offset);
+  return MTL_BAD_IOVA;
+}
+
+static int tv_frame_create_page_table(struct st_tx_video_session_impl* s,
+                                      struct st_frame_trans* frame_info) {
+  struct rte_memseg* mseg = rte_mem_virt2memseg(frame_info->addr, NULL);
+  if (mseg == NULL) {
+    err("%s(%d,%d), get mseg fail\n", __func__, s->idx, frame_info->idx);
+    return -EIO;
+  }
+  size_t hugepage_sz = mseg->hugepage_sz;
+  info("%s(%d,%d), hugepage size %" PRIu64 "\n", __func__, s->idx, frame_info->idx,
+       hugepage_sz);
+
+  /* calculate num hugepages */
+  uint16_t num_pages =
+      RTE_PTR_DIFF(RTE_PTR_ALIGN(frame_info->addr + s->st20_fb_size, hugepage_sz),
+                   RTE_PTR_ALIGN_FLOOR(frame_info->addr, hugepage_sz)) /
+      hugepage_sz;
+
+  struct st_page_info* pages = mt_zmalloc(sizeof(*pages) * num_pages);
+  if (pages == NULL) {
+    err("%s(%d,%d), pages info malloc fail\n", __func__, s->idx, frame_info->idx);
+    return -ENOMEM;
+  }
+
+  /* get IOVA start of each page */
+  void* addr = frame_info->addr;
+  for (uint16_t i = 0; i < num_pages; i++) {
+    /* touch the page before getting its IOVA */
+    *(volatile char*)addr = 0;
+    pages[i].iova = rte_mem_virt2iova(addr);
+    pages[i].addr = addr;
+    void* next_addr = RTE_PTR_ALIGN(RTE_PTR_ADD(addr, 1), hugepage_sz);
+    pages[i].len = RTE_PTR_DIFF(next_addr, addr);
+    addr = next_addr;
+    info("%s(%d,%d), seg %u, va %p, iova 0x%" PRIx64 ", len %" PRIu64 "\n", __func__,
+         s->idx, frame_info->idx, i, pages[i].addr, pages[i].iova, pages[i].len);
+  }
+  frame_info->page_table = pages;
+  frame_info->page_table_len = num_pages;
+
+  return 0;
+}
+
+static inline bool tv_frame_payload_cross_page(struct st_tx_video_session_impl* s,
+                                               struct st_frame_trans* frame_info,
+                                               size_t offset, size_t len) {
+  if (frame_info->page_table_len == 0) return false;
+  return ((tv_frame_get_offset_iova(s, frame_info, offset + len - 1) -
+           tv_frame_get_offset_iova(s, frame_info, offset)) != len - 1);
+}
+
 static int tv_alloc_frames(struct mtl_main_impl* impl,
                            struct st_tx_video_session_impl* s) {
-  enum mtl_port port = mt_port_logic2phy(s->port_maps, MT_SESSION_PORT_P);
+  enum mtl_port port = mt_port_logic2phy(s->port_maps, MTL_SESSION_PORT_P);
   int soc_id = mt_socket_id(impl, port);
   int idx = s->idx;
   struct st_frame_trans* frame_info;
@@ -125,6 +192,8 @@ static int tv_alloc_frames(struct mtl_main_impl* impl,
       frame_info->iova = rte_mem_virt2iova(frame);
       frame_info->addr = frame;
       frame_info->flags = ST_FT_FLAG_RTE_MALLOC;
+      if (impl->iova_mode == RTE_IOVA_PA && !s->tx_no_chain)
+        tv_frame_create_page_table(s, frame_info);
     }
     frame_info->priv = s;
   }
@@ -178,7 +247,7 @@ static int double_cmp(const void* a, const void* b) {
 }
 
 static int tv_train_pacing(struct mtl_main_impl* impl, struct st_tx_video_session_impl* s,
-                           enum mt_session_port s_port) {
+                           enum mtl_session_port s_port) {
   enum mtl_port port = mt_port_logic2phy(s->port_maps, s_port);
   struct rte_mbuf* pad = s->pad[s_port][ST20_PKT_TYPE_NORMAL];
   int idx = s->idx;
@@ -249,11 +318,11 @@ static int tv_train_pacing(struct mtl_main_impl* impl, struct st_tx_video_sessio
   /* parse the pad interval */
   double pkts_per_frame = pkts_per_sec * s->fps_tm.den / s->fps_tm.mul;
   /* adjust as tr offset */
-  double ractive = (1080.0 / 1125.0);
+  double reactive = (1080.0 / 1125.0);
   if (s->ops.interlaced && s->ops.height <= 576) {
-    ractive = (s->ops.height == 480) ? 487.0 / 525.0 : 576.0 / 625.0;
+    reactive = (s->ops.height == 480) ? 487.0 / 525.0 : 576.0 / 625.0;
   }
-  pkts_per_frame = pkts_per_frame * ractive;
+  pkts_per_frame = pkts_per_frame * reactive;
   if (pkts_per_frame < s->st20_total_pkts) {
     err("%s(%d), error pkts_per_frame %f, st20_total_pkts %d\n", __func__, idx,
         pkts_per_frame, s->st20_total_pkts);
@@ -285,14 +354,14 @@ static int tv_init_pacing(struct mtl_main_impl* impl,
   pacing->frame_time = frame_time;
   pacing->frame_time_sampling =
       (double)(s->fps_tm.sampling_clock_rate) * s->fps_tm.den / s->fps_tm.mul;
-  double ractive = 1080.0 / 1125.0;
+  double reactive = 1080.0 / 1125.0;
   pacing->tr_offset =
       s->ops.height >= 1080 ? frame_time * (43.0 / 1125.0) : frame_time * (28.0 / 750.0);
   pacing->tr_offset_vrx = s->st21_vrx_narrow;
 
   if (s->ops.interlaced) {
     if (s->ops.height <= 576)
-      ractive = (s->ops.height == 480) ? 487.0 / 525.0 : 576.0 / 625.0;
+      reactive = (s->ops.height == 480) ? 487.0 / 525.0 : 576.0 / 625.0;
     if (s->ops.height == 480) {
       pacing->tr_offset = frame_time * (20.0 / 525.0) * 2;
     } else if (s->ops.height == 576) {
@@ -301,7 +370,13 @@ static int tv_init_pacing(struct mtl_main_impl* impl,
       pacing->tr_offset = frame_time * (22.0 / 1125.0) * 2;
     }
   }
-  pacing->trs = frame_time * ractive / s->st20_total_pkts;
+  pacing->trs = frame_time * reactive / s->st20_total_pkts;
+  pacing->frame_idle_time = frame_time - pacing->tr_offset - frame_time * reactive;
+  dbg("%s[%02d], frame_idle_time %f\n", __func__, idx, pacing->frame_idle_time);
+  if (pacing->frame_idle_time < 0) {
+    warn("%s[%02d], error frame_idle_time %f\n", __func__, idx, pacing->frame_idle_time);
+    pacing->frame_idle_time = 0;
+  }
   /* always use MTL_PORT_P for ptp now */
   pacing->cur_epochs = mt_get_ptp_time(impl, MTL_PORT_P) / frame_time;
   pacing->tsc_time_cursor = mt_get_tsc(impl);
@@ -347,17 +422,17 @@ static int tv_init_pacing(struct mtl_main_impl* impl,
   }
 
   if (num_port > 1) {
-    if (s->pacing_way[MT_SESSION_PORT_P] != s->pacing_way[MT_SESSION_PORT_R]) {
+    if (s->pacing_way[MTL_SESSION_PORT_P] != s->pacing_way[MTL_SESSION_PORT_R]) {
       /* currently not support two different pacing? */
       warn("%s(%d), different pacing detected, all set to tsc\n", __func__, idx);
-      s->pacing_way[MT_SESSION_PORT_P] = ST21_TX_PACING_WAY_TSC;
-      s->pacing_way[MT_SESSION_PORT_R] = ST21_TX_PACING_WAY_TSC;
+      s->pacing_way[MTL_SESSION_PORT_P] = ST21_TX_PACING_WAY_TSC;
+      s->pacing_way[MTL_SESSION_PORT_R] = ST21_TX_PACING_WAY_TSC;
     }
   }
 
-  /* reslove pacing tasklet */
+  /* resolve pacing tasklet */
   for (int i = 0; i < num_port; i++) {
-    ret = st_video_reslove_pacing_tasklet(s, i);
+    ret = st_video_resolve_pacing_tasklet(s, i);
     if (ret < 0) return ret;
   }
 
@@ -396,7 +471,7 @@ static int tv_sync_pacing(struct mtl_main_impl* impl, struct st_tx_video_session
     epochs = next_epochs;
   }
 
-  /* epoch resloved */
+  /* epoch resolved */
   double ptp_tr_offset_time = pacing_tr_offset_time(pacing, epochs);
   to_epoch_tr_offset = ptp_tr_offset_time - ptp_time;
   if (to_epoch_tr_offset < 0) {
@@ -501,7 +576,7 @@ static int tv_init_st22_boxes(struct mtl_main_impl* impl,
 }
 
 static int tv_init_hdr(struct mtl_main_impl* impl, struct st_tx_video_session_impl* s,
-                       enum mt_session_port s_port) {
+                       enum mtl_session_port s_port) {
   int idx = s->idx;
   enum mtl_port port = mt_port_logic2phy(s->port_maps, s_port);
   int ret;
@@ -516,14 +591,14 @@ static int tv_init_hdr(struct mtl_main_impl* impl, struct st_tx_video_session_im
   struct rte_ether_addr* d_addr = mt_eth_d_addr(eth);
 
   /* ether hdr */
-  if ((s_port == MT_SESSION_PORT_P) && (ops->flags & ST20_TX_FLAG_USER_P_MAC)) {
+  if ((s_port == MTL_SESSION_PORT_P) && (ops->flags & ST20_TX_FLAG_USER_P_MAC)) {
     rte_memcpy(d_addr->addr_bytes, &ops->tx_dst_mac[s_port][0], RTE_ETHER_ADDR_LEN);
     info("%s, USER_P_TX_MAC\n", __func__);
-  } else if ((s_port == MT_SESSION_PORT_R) && (ops->flags & ST20_TX_FLAG_USER_R_MAC)) {
+  } else if ((s_port == MTL_SESSION_PORT_R) && (ops->flags & ST20_TX_FLAG_USER_R_MAC)) {
     rte_memcpy(d_addr->addr_bytes, &ops->tx_dst_mac[s_port][0], RTE_ETHER_ADDR_LEN);
     info("%s, USER_R_TX_MAC\n", __func__);
   } else {
-    ret = mt_dev_dst_ip_mac(impl, dip, d_addr, port, 0);
+    ret = mt_dev_dst_ip_mac(impl, dip, d_addr, port, MT_DEV_TIMEOUT_INFINITE);
     if (ret < 0) {
       err("%s(%d), get mac fail %d for %d.%d.%d.%d\n", __func__, idx, ret, dip[0], dip[1],
           dip[2], dip[3]);
@@ -579,16 +654,35 @@ static int tv_init_hdr(struct mtl_main_impl* impl, struct st_tx_video_session_im
     st22_hdr->f_counter_lo = 0;
   }
 
-  info("%s(%d), dst ip:port %d.%d.%d.%d:%d, port %d\n", __func__, idx, dip[0], dip[1],
-       dip[2], dip[3], s->st20_dst_port[s_port], s_port);
+  info("%s(%d,%d), ip %u.%u.%u.%u port %u:%u\n", __func__, idx, s_port, dip[0], dip[1],
+       dip[2], dip[3], s->st20_src_port[s_port], s->st20_dst_port[s_port]);
   info("%s(%d), mac: %02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx\n", __func__, idx,
        d_addr->addr_bytes[0], d_addr->addr_bytes[1], d_addr->addr_bytes[2],
        d_addr->addr_bytes[3], d_addr->addr_bytes[4], d_addr->addr_bytes[5]);
   return 0;
 }
 
-static int tv_build_pkt(struct mtl_main_impl* impl, struct st_tx_video_session_impl* s,
-                        struct rte_mbuf* pkt, struct rte_mbuf* pkt_chain) {
+static int tv_update_redundant(struct st_tx_video_session_impl* s, struct rte_mbuf* pkt) {
+  struct mt_udp_hdr* hdr = rte_pktmbuf_mtod(pkt, struct mt_udp_hdr*);
+  struct rte_ipv4_hdr* ipv4 = &hdr->ipv4;
+  struct rte_udp_hdr* udp = &hdr->udp;
+
+  /* update the hdr: eth, ip, udp */
+  rte_memcpy(&hdr->eth, &s->s_hdr[MTL_SESSION_PORT_R].eth, sizeof(hdr->eth));
+  ipv4->src_addr = s->s_hdr[MTL_SESSION_PORT_R].ipv4.src_addr;
+  ipv4->dst_addr = s->s_hdr[MTL_SESSION_PORT_R].ipv4.dst_addr;
+  udp->src_port = s->s_hdr[MTL_SESSION_PORT_R].udp.src_port;
+  udp->dst_port = s->s_hdr[MTL_SESSION_PORT_R].udp.dst_port;
+
+  if (!s->eth_ipv4_cksum_offload[MTL_SESSION_PORT_R]) {
+    /* generate cksum if no offload */
+    ipv4->hdr_checksum = rte_ipv4_cksum(ipv4);
+  }
+
+  return 0;
+}
+
+static int tv_build_st20(struct st_tx_video_session_impl* s, struct rte_mbuf* pkt) {
   struct st_rfc4175_video_hdr* hdr;
   struct rte_ipv4_hdr* ipv4;
   struct rte_udp_hdr* udp;
@@ -597,7 +691,113 @@ static int tv_build_pkt(struct mtl_main_impl* impl, struct st_tx_video_session_i
   struct st20_tx_ops* ops = &s->ops;
   uint32_t offset;
   uint16_t line1_number, line1_offset;
-  uint16_t line1_length, line2_length;
+  uint16_t line1_length = 0, line2_length = 0;
+  bool single_line = (ops->packing == ST20_PACKING_GPM_SL);
+  struct st_frame_trans* frame_info = &s->st20_frames[s->st20_frame_idx];
+
+  hdr = rte_pktmbuf_mtod(pkt, struct st_rfc4175_video_hdr*);
+  ipv4 = &hdr->ipv4;
+  rtp = &hdr->rtp;
+  udp = &hdr->udp;
+
+  /* copy the basic hdrs: eth, ip, udp, rtp */
+  rte_memcpy(hdr, &s->s_hdr[MTL_SESSION_PORT_P], sizeof(*hdr));
+
+  /* update ipv4 hdr */
+  ipv4->packet_id = htons(s->st20_ipv4_packet_id);
+  s->st20_ipv4_packet_id++;
+
+  if (s->multi_src_port) udp->src_port += (s->st20_pkt_idx / 128) % 8;
+
+  /* calculate payload header */
+  if (single_line) {
+    line1_number = s->st20_pkt_idx / s->st20_pkts_in_line;
+    int pixel_in_pkt = s->st20_pkt_len / s->st20_pg.size * s->st20_pg.coverage;
+    line1_offset = pixel_in_pkt * (s->st20_pkt_idx % s->st20_pkts_in_line);
+    offset = line1_number * s->st20_linesize +
+             line1_offset / s->st20_pg.coverage * s->st20_pg.size;
+  } else {
+    offset = s->st20_pkt_len * s->st20_pkt_idx;
+    line1_number = offset / s->st20_bytes_in_line;
+    line1_offset =
+        (offset % s->st20_bytes_in_line) * s->st20_pg.coverage / s->st20_pg.size;
+    if ((offset + s->st20_pkt_len > (line1_number + 1) * s->st20_bytes_in_line) &&
+        (offset + s->st20_pkt_len < s->st20_frame_size))
+      e_rtp =
+          rte_pktmbuf_mtod_offset(pkt, struct st20_rfc4175_extra_rtp_hdr*, sizeof(*hdr));
+  }
+
+  /* update rtp hdr */
+  if (s->st20_pkt_idx >= (s->st20_total_pkts - 1)) rtp->base.marker = 1;
+  rtp->base.seq_number = htons((uint16_t)s->st20_seq_id);
+  rtp->seq_number_ext = htons((uint16_t)(s->st20_seq_id >> 16));
+  s->st20_seq_id++;
+  uint16_t field = frame_info->tv_meta.second_field ? ST20_SECOND_FIELD : 0x0000;
+  rtp->row_number = htons(line1_number | field);
+  rtp->row_offset = htons(line1_offset);
+  rtp->base.tmstamp = htonl(s->pacing.rtp_time_stamp);
+
+  uint32_t temp =
+      single_line ? ((ops->width - line1_offset) / s->st20_pg.coverage * s->st20_pg.size)
+                  : (s->st20_frame_size - offset);
+  uint16_t left_len = RTE_MIN(s->st20_pkt_len, temp);
+  rtp->row_length = htons(left_len);
+
+  if (e_rtp) {
+    line1_length = (line1_number + 1) * s->st20_bytes_in_line - offset;
+    line2_length = s->st20_pkt_len - line1_length;
+    rtp->row_length = htons(line1_length);
+    e_rtp->row_length = htons(line2_length);
+    e_rtp->row_offset = htons(0);
+    e_rtp->row_number = htons((line1_number + 1) | field);
+    rtp->row_offset = htons(line1_offset | ST20_SRD_OFFSET_CONTINUATION);
+  }
+
+  /* update mbuf */
+  mt_mbuf_init_ipv4(pkt);
+
+  if (!single_line && s->st20_linesize > s->st20_bytes_in_line)
+    /* update offset with line padding for copying */
+    offset = offset % s->st20_bytes_in_line + line1_number * s->st20_linesize;
+  /* copy payload */
+  void* payload = NULL;
+  if (e_rtp)
+    payload = &e_rtp[1];
+  else
+    payload = &rtp[1];
+  if (e_rtp && s->st20_linesize > s->st20_bytes_in_line) {
+    /* cross lines with padding case */
+    mtl_memcpy(payload, frame_info->addr + offset, line1_length);
+    mtl_memcpy(payload + line1_length,
+               frame_info->addr + s->st20_linesize * (line1_number + 1), line2_length);
+  } else {
+    mtl_memcpy(payload, frame_info->addr + offset, left_len);
+  }
+  pkt->data_len = sizeof(struct st_rfc4175_video_hdr) + left_len;
+  if (e_rtp) pkt->data_len += sizeof(*e_rtp);
+  pkt->pkt_len = pkt->data_len;
+
+  udp->dgram_len = htons(pkt->pkt_len - pkt->l2_len - pkt->l3_len);
+  ipv4->total_length = htons(pkt->pkt_len - pkt->l2_len);
+  if (!s->eth_ipv4_cksum_offload[MTL_SESSION_PORT_P]) {
+    /* generate cksum if no offload */
+    ipv4->hdr_checksum = rte_ipv4_cksum(ipv4);
+  }
+
+  return 0;
+}
+
+static int tv_build_st20_chain(struct st_tx_video_session_impl* s, struct rte_mbuf* pkt,
+                               struct rte_mbuf* pkt_chain) {
+  struct st_rfc4175_video_hdr* hdr;
+  struct rte_ipv4_hdr* ipv4;
+  struct rte_udp_hdr* udp;
+  struct st20_rfc4175_rtp_hdr* rtp;
+  struct st20_rfc4175_extra_rtp_hdr* e_rtp = NULL;
+  struct st20_tx_ops* ops = &s->ops;
+  uint32_t offset;
+  uint16_t line1_number, line1_offset;
+  uint16_t line1_length = 0, line2_length = 0;
   bool single_line = (ops->packing == ST20_PACKING_GPM_SL);
   struct st_frame_trans* frame_info = &s->st20_frames[s->st20_frame_idx];
 
@@ -607,11 +807,13 @@ static int tv_build_pkt(struct mtl_main_impl* impl, struct st_tx_video_session_i
   udp = &hdr->udp;
 
   /* copy the hdr: eth, ip, udp, rtp */
-  rte_memcpy(hdr, &s->s_hdr[MT_SESSION_PORT_P], sizeof(*hdr));
+  rte_memcpy(hdr, &s->s_hdr[MTL_SESSION_PORT_P], sizeof(*hdr));
 
   /* update ipv4 hdr */
   ipv4->packet_id = htons(s->st20_ipv4_packet_id);
   s->st20_ipv4_packet_id++;
+
+  if (s->multi_src_port) udp->src_port += (s->st20_pkt_idx / 128) % 8;
 
   if (single_line) {
     line1_number = s->st20_pkt_idx / s->st20_pkts_in_line;
@@ -668,28 +870,38 @@ static int tv_build_pkt(struct mtl_main_impl* impl, struct st_tx_video_session_i
 
   if (e_rtp && s->st20_linesize > s->st20_bytes_in_line) {
     /* cross lines with padding case */
+    /* re-allocate from copy chain mempool */
+    rte_pktmbuf_free(pkt_chain);
+    pkt_chain = rte_pktmbuf_alloc(s->mbuf_mempool_copy_chain);
+    if (!pkt_chain) {
+      dbg("%s(%d), pkts chain realloc fail %d\n", __func__, s->idx, s->st20_pkt_idx);
+      s->stat_pkts_chain_realloc_fail++; /* we can do nothing but count */
+      return -ENOMEM;
+    }
     /* do not attach extbuf, copy to data room */
     void* payload = rte_pktmbuf_mtod(pkt_chain, void*);
     mtl_memcpy(payload, frame_info->addr + offset, line1_length);
     mtl_memcpy(payload + line1_length,
                frame_info->addr + s->st20_linesize * (line1_number + 1), line2_length);
+  } else if (tv_frame_payload_cross_page(s, frame_info, offset, left_len)) {
+    /* do not attach extbuf, copy to data room */
+    void* payload = rte_pktmbuf_mtod(pkt_chain, void*);
+    mtl_memcpy(payload, frame_info->addr + offset, left_len);
   } else {
     /* attach payload to chainbuf */
     rte_pktmbuf_attach_extbuf(pkt_chain, frame_info->addr + offset,
-                              frame_info->iova + offset, left_len, &frame_info->sh_info);
+                              tv_frame_get_offset_iova(s, frame_info, offset), left_len,
+                              &frame_info->sh_info);
     rte_mbuf_ext_refcnt_update(&frame_info->sh_info, 1);
   }
   pkt_chain->data_len = pkt_chain->pkt_len = left_len;
 
   /* chain the pkt */
   rte_pktmbuf_chain(pkt, pkt_chain);
-  if (!s->eth_has_chain[MT_SESSION_PORT_P]) {
-    mt_mbuf_chain_sw(pkt, pkt_chain);
-  }
 
   udp->dgram_len = htons(pkt->pkt_len - pkt->l2_len - pkt->l3_len);
   ipv4->total_length = htons(pkt->pkt_len - pkt->l2_len);
-  if (!s->eth_ipv4_cksum_offload[MT_SESSION_PORT_P]) {
+  if (!s->eth_ipv4_cksum_offload[MTL_SESSION_PORT_P]) {
     /* generate cksum if no offload */
     ipv4->hdr_checksum = rte_ipv4_cksum(ipv4);
   }
@@ -697,8 +909,63 @@ static int tv_build_pkt(struct mtl_main_impl* impl, struct st_tx_video_session_i
   return 0;
 }
 
-static int tv_build_rtp(struct mtl_main_impl* impl, struct st_tx_video_session_impl* s,
-                        struct rte_mbuf* pkt, struct rte_mbuf* pkt_chain) {
+static int tv_build_st20_redundant_chain(struct st_tx_video_session_impl* s,
+                                         struct rte_mbuf* pkt_r,
+                                         struct rte_mbuf* pkt_base) {
+  struct st_rfc4175_video_hdr* hdr;
+  struct st_rfc4175_video_hdr* hdr_base;
+  struct rte_ipv4_hdr* ipv4;
+  struct rte_ipv4_hdr* ipv4_base;
+  struct st20_rfc4175_rtp_hdr* rtp;
+  struct st20_rfc4175_rtp_hdr* rtp_base;
+
+  hdr = rte_pktmbuf_mtod(pkt_r, struct st_rfc4175_video_hdr*);
+  ipv4 = &hdr->ipv4;
+  rtp = &hdr->rtp;
+
+  /* copy the hdr: eth, ip, udp, rtp */
+  rte_memcpy(hdr, &s->s_hdr[MTL_SESSION_PORT_R], sizeof(*hdr));
+
+  /* update rtp */
+  hdr_base = rte_pktmbuf_mtod(pkt_base, struct st_rfc4175_video_hdr*);
+  ipv4_base = &hdr_base->ipv4;
+  /* update ipv4 hdr */
+  ipv4->packet_id = ipv4_base->packet_id;
+
+  rtp_base = &hdr_base->rtp;
+  rte_memcpy(rtp, rtp_base, sizeof(*rtp));
+
+  /* copy extra if Continuation */
+  uint16_t line1_offset = ntohs(rtp->row_offset);
+  if (line1_offset & ST20_SRD_OFFSET_CONTINUATION) {
+    rte_memcpy(&rtp[1], &rtp_base[1], sizeof(struct st20_rfc4175_extra_rtp_hdr));
+  }
+
+  /* update mbuf */
+  pkt_r->data_len = pkt_base->data_len;
+  pkt_r->pkt_len = pkt_base->pkt_len;
+  pkt_r->l2_len = pkt_base->l2_len;
+  pkt_r->l3_len = pkt_base->l3_len;
+  pkt_r->ol_flags = pkt_base->ol_flags;
+  pkt_r->nb_segs = 2;
+  /* chain mbuf */
+  struct rte_mbuf* pkt_chain = pkt_base->next;
+  pkt_r->next = pkt_chain;
+
+  rte_mbuf_refcnt_update(pkt_chain, 1);
+  hdr->udp.dgram_len = htons(pkt_r->pkt_len - pkt_r->l2_len - pkt_r->l3_len);
+  ipv4->total_length = htons(pkt_r->pkt_len - pkt_r->l2_len);
+  if (!s->eth_ipv4_cksum_offload[MTL_SESSION_PORT_R]) {
+    /* generate cksum if no offload */
+    ipv4->hdr_checksum = rte_ipv4_cksum(ipv4);
+  }
+
+  return 0;
+}
+
+static int tv_build_rtp_chain(struct mtl_main_impl* impl,
+                              struct st_tx_video_session_impl* s, struct rte_mbuf* pkt,
+                              struct rte_mbuf* pkt_chain) {
   struct mt_udp_hdr* hdr;
   struct rte_ipv4_hdr* ipv4;
   struct st_rfc3550_rtp_hdr* rtp;
@@ -710,13 +977,15 @@ static int tv_build_rtp(struct mtl_main_impl* impl, struct st_tx_video_session_i
   rtp = rte_pktmbuf_mtod(pkt_chain, struct st_rfc3550_rtp_hdr*);
 
   /* copy the hdr: eth, ip, udp */
-  rte_memcpy(&hdr->eth, &s->s_hdr[MT_SESSION_PORT_P].eth, sizeof(hdr->eth));
-  rte_memcpy(ipv4, &s->s_hdr[MT_SESSION_PORT_P].ipv4, sizeof(hdr->ipv4));
-  rte_memcpy(udp, &s->s_hdr[MT_SESSION_PORT_P].udp, sizeof(hdr->udp));
+  rte_memcpy(&hdr->eth, &s->s_hdr[MTL_SESSION_PORT_P].eth, sizeof(hdr->eth));
+  rte_memcpy(ipv4, &s->s_hdr[MTL_SESSION_PORT_P].ipv4, sizeof(hdr->ipv4));
+  rte_memcpy(udp, &s->s_hdr[MTL_SESSION_PORT_P].udp, sizeof(hdr->udp));
 
   /* update ipv4 hdr */
   ipv4->packet_id = htons(s->st20_ipv4_packet_id);
   s->st20_ipv4_packet_id++;
+
+  if (s->multi_src_port) udp->src_port += (s->st20_pkt_idx / 128) % 8;
 
   if (rtp->tmstamp != s->st20_rtp_time) {
     /* start of a new frame */
@@ -739,22 +1008,19 @@ static int tv_build_rtp(struct mtl_main_impl* impl, struct st_tx_video_session_i
 
   /* chain the pkt */
   rte_pktmbuf_chain(pkt, pkt_chain);
-  if (!s->eth_has_chain[MT_SESSION_PORT_P]) {
-    mt_mbuf_chain_sw(pkt, pkt_chain);
-  }
 
   udp->dgram_len = htons(pkt->pkt_len - pkt->l2_len - pkt->l3_len);
   ipv4->total_length = htons(pkt->pkt_len - pkt->l2_len);
-  if (!s->eth_ipv4_cksum_offload[MT_SESSION_PORT_P]) {
+  if (!s->eth_ipv4_cksum_offload[MTL_SESSION_PORT_P]) {
     /* generate cksum if no offload */
     ipv4->hdr_checksum = rte_ipv4_cksum(ipv4);
   }
   return 0;
 }
 
-static int tv_build_redundant_rtp(struct st_tx_video_session_impl* s,
-                                  struct rte_mbuf* pkt_r, struct rte_mbuf* pkt_base,
-                                  struct rte_mbuf* pkt_chain) {
+static int tv_build_rtp_redundant_chain(struct st_tx_video_session_impl* s,
+                                        struct rte_mbuf* pkt_r,
+                                        struct rte_mbuf* pkt_base) {
   struct rte_ipv4_hdr *ipv4, *ipv4_base;
   struct mt_udp_hdr *hdr, *hdr_base;
 
@@ -764,16 +1030,12 @@ static int tv_build_redundant_rtp(struct st_tx_video_session_impl* s,
   ipv4_base = &hdr_base->ipv4;
 
   /* copy the hdr: eth, ip, udp */
-  rte_memcpy(&hdr->eth, &s->s_hdr[MT_SESSION_PORT_R].eth, sizeof(hdr->eth));
-  rte_memcpy(ipv4, &s->s_hdr[MT_SESSION_PORT_R].ipv4, sizeof(hdr->ipv4));
-  rte_memcpy(&hdr->udp, &s->s_hdr[MT_SESSION_PORT_R].udp, sizeof(hdr->udp));
+  rte_memcpy(&hdr->eth, &s->s_hdr[MTL_SESSION_PORT_R].eth, sizeof(hdr->eth));
+  rte_memcpy(ipv4, &s->s_hdr[MTL_SESSION_PORT_R].ipv4, sizeof(hdr->ipv4));
+  rte_memcpy(&hdr->udp, &s->s_hdr[MTL_SESSION_PORT_R].udp, sizeof(hdr->udp));
 
   /* update ipv4 hdr */
   ipv4->packet_id = ipv4_base->packet_id;
-
-  if (!s->eth_has_chain[MT_SESSION_PORT_R]) {
-    mt_mbuf_chain_sw_copy(pkt_r, pkt_chain);
-  }
 
   /* update mbuf */
   pkt_r->data_len = pkt_base->data_len;
@@ -783,12 +1045,13 @@ static int tv_build_redundant_rtp(struct st_tx_video_session_impl* s,
   pkt_r->ol_flags = pkt_base->ol_flags;
   pkt_r->nb_segs = 2;
   /* chain mbuf */
+  struct rte_mbuf* pkt_chain = pkt_base->next;
   pkt_r->next = pkt_chain;
 
   rte_mbuf_refcnt_update(pkt_chain, 1);
   hdr->udp.dgram_len = htons(pkt_r->pkt_len - pkt_r->l2_len - pkt_r->l3_len);
   ipv4->total_length = htons(pkt_r->pkt_len - pkt_r->l2_len);
-  if (!s->eth_ipv4_cksum_offload[MT_SESSION_PORT_R]) {
+  if (!s->eth_ipv4_cksum_offload[MTL_SESSION_PORT_R]) {
     /* generate cksum if no offload */
     ipv4->hdr_checksum = rte_ipv4_cksum(ipv4);
   }
@@ -796,64 +1059,7 @@ static int tv_build_redundant_rtp(struct st_tx_video_session_impl* s,
   return 0;
 }
 
-static int tv_build_redundant(struct st_tx_video_session_impl* s, struct rte_mbuf* pkt_r,
-                              struct rte_mbuf* pkt_base, struct rte_mbuf* pkt_chain) {
-  struct st_rfc4175_video_hdr* hdr;
-  struct st_rfc4175_video_hdr* hdr_base;
-  struct rte_ipv4_hdr* ipv4;
-  struct rte_ipv4_hdr* ipv4_base;
-  struct st20_rfc4175_rtp_hdr* rtp;
-  struct st20_rfc4175_rtp_hdr* rtp_base;
-
-  hdr = rte_pktmbuf_mtod(pkt_r, struct st_rfc4175_video_hdr*);
-  ipv4 = &hdr->ipv4;
-  rtp = &hdr->rtp;
-
-  /* copy the hdr: eth, ip, udp, rtp */
-  rte_memcpy(hdr, &s->s_hdr[MT_SESSION_PORT_R], sizeof(*hdr));
-
-  /* update rtp */
-  hdr_base = rte_pktmbuf_mtod(pkt_base, struct st_rfc4175_video_hdr*);
-  ipv4_base = &hdr_base->ipv4;
-  /* update ipv4 hdr */
-  ipv4->packet_id = ipv4_base->packet_id;
-
-  rtp_base = &hdr_base->rtp;
-  rte_memcpy(rtp, rtp_base, sizeof(*rtp));
-
-  /* copy extra if Continuation */
-  uint16_t line1_offset = ntohs(rtp->row_offset);
-  if (line1_offset & ST20_SRD_OFFSET_CONTINUATION) {
-    rte_memcpy(&rtp[1], &rtp_base[1], sizeof(struct st20_rfc4175_extra_rtp_hdr));
-  }
-
-  if (!s->eth_has_chain[MT_SESSION_PORT_R]) {
-    mt_mbuf_chain_sw_copy(pkt_r, pkt_chain);
-  }
-
-  /* update mbuf */
-  pkt_r->data_len = pkt_base->data_len;
-  pkt_r->pkt_len = pkt_base->pkt_len;
-  pkt_r->l2_len = pkt_base->l2_len;
-  pkt_r->l3_len = pkt_base->l3_len;
-  pkt_r->ol_flags = pkt_base->ol_flags;
-  pkt_r->nb_segs = 2;
-  /* chain mbuf */
-  pkt_r->next = pkt_chain;
-
-  rte_mbuf_refcnt_update(pkt_chain, 1);
-  hdr->udp.dgram_len = htons(pkt_r->pkt_len - pkt_r->l2_len - pkt_r->l3_len);
-  ipv4->total_length = htons(pkt_r->pkt_len - pkt_r->l2_len);
-  if (!s->eth_ipv4_cksum_offload[MT_SESSION_PORT_R]) {
-    /* generate cksum if no offload */
-    ipv4->hdr_checksum = rte_ipv4_cksum(ipv4);
-  }
-
-  return 0;
-}
-
-static int tv_build_st22(struct mtl_main_impl* impl, struct st_tx_video_session_impl* s,
-                         struct rte_mbuf* pkt, struct rte_mbuf* pkt_chain) {
+static int tv_build_st22(struct st_tx_video_session_impl* s, struct rte_mbuf* pkt) {
   struct st22_rfc9134_video_hdr* hdr;
   struct rte_ipv4_hdr* ipv4;
   struct rte_udp_hdr* udp;
@@ -866,11 +1072,81 @@ static int tv_build_st22(struct mtl_main_impl* impl, struct st_tx_video_session_
   udp = &hdr->udp;
 
   /* copy the hdr: eth, ip, udp */
-  rte_memcpy(&hdr->eth, &s->s_hdr[MT_SESSION_PORT_P].eth, sizeof(hdr->eth));
-  rte_memcpy(ipv4, &s->s_hdr[MT_SESSION_PORT_P].ipv4, sizeof(*ipv4));
-  rte_memcpy(udp, &s->s_hdr[MT_SESSION_PORT_P].udp, sizeof(*udp));
+  rte_memcpy(&hdr->eth, &s->s_hdr[MTL_SESSION_PORT_P].eth, sizeof(hdr->eth));
+  rte_memcpy(ipv4, &s->s_hdr[MTL_SESSION_PORT_P].ipv4, sizeof(*ipv4));
+  rte_memcpy(udp, &s->s_hdr[MTL_SESSION_PORT_P].udp, sizeof(*udp));
   /* copy rtp */
-  rte_memcpy(rtp, &st22_info->rtp_hdr[MT_SESSION_PORT_P], sizeof(*rtp));
+  rte_memcpy(rtp, &st22_info->rtp_hdr[MTL_SESSION_PORT_P], sizeof(*rtp));
+
+  /* update ipv4 hdr */
+  ipv4->packet_id = htons(s->st20_ipv4_packet_id);
+  s->st20_ipv4_packet_id++;
+
+  /* update rtp */
+  if (s->st20_pkt_idx >= (st22_info->st22_total_pkts - 1)) {
+    rtp->base.marker = 1;
+    rtp->last_packet = 1;
+    dbg("%s(%d), maker on pkt %d(total %d)\n", __func__, s->idx, s->st20_pkt_idx,
+        s->st22_total_pkts);
+  }
+  rtp->base.seq_number = htons((uint16_t)s->st20_seq_id);
+  s->st20_seq_id++;
+  rtp->base.tmstamp = htonl(s->pacing.rtp_time_stamp);
+  uint16_t f_counter = st22_info->frame_idx % 32;
+  uint16_t sep_counter = s->st20_pkt_idx / 2048;
+  uint16_t p_counter = s->st20_pkt_idx % 2048;
+  rtp->p_counter_lo = p_counter;
+  rtp->p_counter_hi = p_counter >> 8;
+  rtp->sep_counter_lo = sep_counter;
+  rtp->sep_counter_hi = sep_counter >> 5;
+  rtp->f_counter_lo = f_counter;
+  rtp->f_counter_hi = f_counter >> 2;
+
+  /* update mbuf */
+  mt_mbuf_init_ipv4(pkt);
+
+  uint32_t offset = s->st20_pkt_idx * s->st20_pkt_len;
+  uint16_t left_len = RTE_MIN(s->st20_pkt_len, st22_info->cur_frame_size - offset);
+  dbg("%s(%d), data len %u on pkt %d(total %d)\n", __func__, s->idx, left_len,
+      s->st20_pkt_idx, s->st22_total_pkts);
+
+  /* copy payload */
+  struct st_frame_trans* frame_info = &s->st20_frames[s->st20_frame_idx];
+  void* payload = &rtp[1];
+  mtl_memcpy(payload, frame_info->addr + offset, left_len);
+
+  pkt->data_len = sizeof(*hdr) + left_len;
+  pkt->pkt_len = pkt->data_len;
+
+  udp->dgram_len = htons(pkt->pkt_len - pkt->l2_len - pkt->l3_len);
+  ipv4->total_length = htons(pkt->pkt_len - pkt->l2_len);
+  if (!s->eth_ipv4_cksum_offload[MTL_SESSION_PORT_P]) {
+    /* generate cksum if no offload */
+    ipv4->hdr_checksum = rte_ipv4_cksum(ipv4);
+  }
+
+  return 0;
+}
+
+static int tv_build_st22_chain(struct st_tx_video_session_impl* s, struct rte_mbuf* pkt,
+                               struct rte_mbuf* pkt_chain) {
+  struct st22_rfc9134_video_hdr* hdr;
+  struct rte_ipv4_hdr* ipv4;
+  struct rte_udp_hdr* udp;
+  struct st22_rfc9134_rtp_hdr* rtp;
+  struct st22_tx_video_info* st22_info = s->st22_info;
+
+  hdr = rte_pktmbuf_mtod(pkt, struct st22_rfc9134_video_hdr*);
+  ipv4 = &hdr->ipv4;
+  rtp = &hdr->rtp;
+  udp = &hdr->udp;
+
+  /* copy the hdr: eth, ip, udp */
+  rte_memcpy(&hdr->eth, &s->s_hdr[MTL_SESSION_PORT_P].eth, sizeof(hdr->eth));
+  rte_memcpy(ipv4, &s->s_hdr[MTL_SESSION_PORT_P].ipv4, sizeof(*ipv4));
+  rte_memcpy(udp, &s->s_hdr[MTL_SESSION_PORT_P].udp, sizeof(*udp));
+  /* copy rtp */
+  rte_memcpy(rtp, &st22_info->rtp_hdr[MTL_SESSION_PORT_P], sizeof(*rtp));
 
   /* update ipv4 hdr */
   ipv4->packet_id = htons(s->st20_ipv4_packet_id);
@@ -908,21 +1184,25 @@ static int tv_build_st22(struct mtl_main_impl* impl, struct st_tx_video_session_
 
   /* attach payload to chainbuf */
   struct st_frame_trans* frame_info = &s->st20_frames[s->st20_frame_idx];
-  rte_pktmbuf_attach_extbuf(pkt_chain, frame_info->addr + offset,
-                            frame_info->iova + offset, left_len, &frame_info->sh_info);
-  rte_mbuf_ext_refcnt_update(&frame_info->sh_info, 1);
+  if (tv_frame_payload_cross_page(s, frame_info, offset, left_len)) {
+    /* do not attach extbuf, copy to data room */
+    void* payload = rte_pktmbuf_mtod(pkt_chain, void*);
+    mtl_memcpy(payload, frame_info->addr + offset, left_len);
+  } else { /* attach payload */
+    rte_pktmbuf_attach_extbuf(pkt_chain, frame_info->addr + offset,
+                              tv_frame_get_offset_iova(s, frame_info, offset), left_len,
+                              &frame_info->sh_info);
+    rte_mbuf_ext_refcnt_update(&frame_info->sh_info, 1);
+  }
 
   pkt_chain->data_len = pkt_chain->pkt_len = left_len;
 
   /* chain the pkt */
   rte_pktmbuf_chain(pkt, pkt_chain);
-  if (!s->eth_has_chain[MT_SESSION_PORT_P]) {
-    mt_mbuf_chain_sw(pkt, pkt_chain);
-  }
 
   udp->dgram_len = htons(pkt->pkt_len - pkt->l2_len - pkt->l3_len);
   ipv4->total_length = htons(pkt->pkt_len - pkt->l2_len);
-  if (!s->eth_ipv4_cksum_offload[MT_SESSION_PORT_P]) {
+  if (!s->eth_ipv4_cksum_offload[MTL_SESSION_PORT_P]) {
     /* generate cksum if no offload */
     ipv4->hdr_checksum = rte_ipv4_cksum(ipv4);
   }
@@ -930,9 +1210,9 @@ static int tv_build_st22(struct mtl_main_impl* impl, struct st_tx_video_session_
   return 0;
 }
 
-static int tv_build_st22_redundant(struct st_tx_video_session_impl* s,
-                                   struct rte_mbuf* pkt_r, struct rte_mbuf* pkt_base,
-                                   struct rte_mbuf* pkt_chain) {
+static int tv_build_st22_redundant_chain(struct st_tx_video_session_impl* s,
+                                         struct rte_mbuf* pkt_r,
+                                         struct rte_mbuf* pkt_base) {
   struct st22_rfc9134_video_hdr* hdr;
   struct st22_rfc9134_video_hdr* hdr_base;
   struct rte_ipv4_hdr* ipv4;
@@ -945,7 +1225,7 @@ static int tv_build_st22_redundant(struct st_tx_video_session_impl* s,
   rtp = &hdr->rtp;
 
   /* copy the hdr: eth, ip, udp, rtp */
-  rte_memcpy(hdr, &s->s_hdr[MT_SESSION_PORT_R], sizeof(*hdr));
+  rte_memcpy(hdr, &s->s_hdr[MTL_SESSION_PORT_R], sizeof(*hdr));
 
   /* update rtp */
   hdr_base = rte_pktmbuf_mtod(pkt_base, struct st22_rfc9134_video_hdr*);
@@ -964,16 +1244,13 @@ static int tv_build_st22_redundant(struct st_tx_video_session_impl* s,
   pkt_r->ol_flags = pkt_base->ol_flags;
   pkt_r->nb_segs = 2;
   /* chain mbuf */
+  struct rte_mbuf* pkt_chain = pkt_base->next;
   pkt_r->next = pkt_chain;
-
-  if (!s->eth_has_chain[MT_SESSION_PORT_R]) {
-    mt_mbuf_chain_sw(pkt_r, pkt_chain);
-  }
 
   rte_mbuf_refcnt_update(pkt_chain, 1);
   hdr->udp.dgram_len = htons(pkt_r->pkt_len - pkt_r->l2_len - pkt_r->l3_len);
   ipv4->total_length = htons(pkt_r->pkt_len - pkt_r->l2_len);
-  if (!s->eth_ipv4_cksum_offload[MT_SESSION_PORT_R]) {
+  if (!s->eth_ipv4_cksum_offload[MTL_SESSION_PORT_R]) {
     /* generate cksum if no offload */
     ipv4->hdr_checksum = rte_ipv4_cksum(ipv4);
   }
@@ -1004,7 +1281,7 @@ static int tv_tasklet_pre_start(void* priv) { return 0; }
 
 static int tv_tasklet_start(void* priv) {
   struct st_tx_video_sessions_mgr* mgr = priv;
-  struct mtl_main_impl* impl = mgr->parnet;
+  struct mtl_main_impl* impl = mgr->parent;
   struct st_tx_video_session_impl* s;
 
   for (int sidx = 0; sidx < mgr->max_idx; sidx++) {
@@ -1029,39 +1306,40 @@ static int tv_tasklet_frame(struct mtl_main_impl* impl,
   struct st_tx_video_pacing* pacing = &s->pacing;
   int ret;
   bool send_r = false;
-  struct rte_mempool* hdr_pool_p = s->mbuf_mempool_hdr[MT_SESSION_PORT_P];
+  struct rte_mempool* hdr_pool_p = s->mbuf_mempool_hdr[MTL_SESSION_PORT_P];
   struct rte_mempool* hdr_pool_r = NULL;
   struct rte_mempool* chain_pool = s->mbuf_mempool_chain;
-  struct rte_ring* ring_p = s->ring[MT_SESSION_PORT_P];
+  struct rte_ring* ring_p = s->ring[MTL_SESSION_PORT_P];
   struct rte_ring* ring_r = NULL;
+  int num_port = ops->num_port;
 
   if (rte_ring_full(ring_p)) {
     s->stat_build_ret_code = -STI_FRAME_RING_FULL;
     return MT_TASKLET_ALL_DONE;
   }
 
-  if (s->ops.num_port > 1) {
+  if (num_port > 1) {
     send_r = true;
-    hdr_pool_r = s->mbuf_mempool_hdr[MT_SESSION_PORT_R];
-    ring_r = s->ring[MT_SESSION_PORT_R];
+    hdr_pool_r = s->mbuf_mempool_hdr[MTL_SESSION_PORT_R];
+    ring_r = s->ring[MTL_SESSION_PORT_R];
   }
 
   /* check if any inflight pkts */
-  if (s->has_inflight[MT_SESSION_PORT_P]) {
-    n = rte_ring_sp_enqueue_bulk(ring_p, (void**)&s->inflight[MT_SESSION_PORT_P][0], bulk,
-                                 NULL);
+  if (s->has_inflight[MTL_SESSION_PORT_P]) {
+    n = rte_ring_sp_enqueue_bulk(ring_p, (void**)&s->inflight[MTL_SESSION_PORT_P][0],
+                                 bulk, NULL);
     if (n > 0) {
-      s->has_inflight[MT_SESSION_PORT_P] = false;
+      s->has_inflight[MTL_SESSION_PORT_P] = false;
     } else {
       s->stat_build_ret_code = -STI_FRAME_INFLIGHT_ENQUEUE_FAIL;
       return MT_TASKLET_ALL_DONE;
     }
   }
-  if (send_r && s->has_inflight[MT_SESSION_PORT_R]) {
-    n = rte_ring_sp_enqueue_bulk(ring_r, (void**)&s->inflight[MT_SESSION_PORT_R][0], bulk,
-                                 NULL);
+  if (send_r && s->has_inflight[MTL_SESSION_PORT_R]) {
+    n = rte_ring_sp_enqueue_bulk(ring_r, (void**)&s->inflight[MTL_SESSION_PORT_R][0],
+                                 bulk, NULL);
     if (n > 0) {
-      s->has_inflight[MT_SESSION_PORT_R] = false;
+      s->has_inflight[MTL_SESSION_PORT_R] = false;
     } else {
       s->stat_build_ret_code = -STI_FRAME_INFLIGHT_R_ENQUEUE_FAIL;
       return MT_TASKLET_ALL_DONE;
@@ -1086,6 +1364,25 @@ static int tv_tasklet_frame(struct mtl_main_impl* impl,
           s->stat_user_busy_first = false;
           dbg("%s(%d), get_next_frame fail %d\n", __func__, idx, ret);
         }
+        if (s->tx_done_cleanup[MTL_SESSION_PORT_P] &&
+            (mt_get_tsc(impl) > pacing->tsc_time_cursor)) {
+          /* flush tx queue to cleanup all mbufs, for tv_frame_free_cb */
+          dbg("%s(%d), tx done cleanup %u\n", __func__, s->idx,
+              s->tx_done_cleanup[MTL_SESSION_PORT_P]);
+          for (int i = 0; i < num_port; i++) {
+            struct rte_mbuf* pad = s->pad[i][ST20_PKT_TYPE_NORMAL];
+            if (!pad) continue;
+
+            rte_mbuf_refcnt_update(pad, 1);
+            uint16_t tx = mt_dev_tx_burst(s->queue[i], &pad, 1);
+            if (tx < 1) {
+              rte_mbuf_refcnt_update(pad, -1);
+            } else {
+              s->tx_done_cleanup[i]--;
+              s->stat_tx_done_cleanup++;
+            }
+          }
+        }
         s->stat_build_ret_code = -STI_FRAME_APP_GET_FRAME_BUSY;
         return MT_TASKLET_ALL_DONE;
       }
@@ -1105,6 +1402,9 @@ static int tv_tasklet_frame(struct mtl_main_impl* impl,
       rte_atomic32_inc(&frame->refcnt);
       s->st20_frame_idx = next_frame_idx;
       s->st20_frame_lines_ready = 0;
+      for (int i = 0; i < num_port; i++) {
+        s->tx_done_cleanup[i] = s->queue_burst_pkts[i];
+      }
       dbg("%s(%d), next_frame_idx %d start\n", __func__, idx, next_frame_idx);
       s->st20_frame_stat = ST21_TX_STAT_SENDING_PKTS;
 
@@ -1150,39 +1450,43 @@ static int tv_tasklet_frame(struct mtl_main_impl* impl,
   struct rte_mbuf* pkts_r[bulk];
   struct rte_mbuf* pkts_chain[bulk];
 
-  ret = rte_pktmbuf_alloc_bulk(chain_pool, pkts_chain, bulk);
-  if (ret < 0) {
-    dbg("%s(%d), pkts chain alloc fail %d\n", __func__, idx, ret);
-    s->stat_build_ret_code = -STI_FRAME_PKT_ALLOC_FAIL;
-    return MT_TASKLET_ALL_DONE;
-  }
-
   ret = rte_pktmbuf_alloc_bulk(hdr_pool_p, pkts, bulk);
   if (ret < 0) {
     dbg("%s(%d), pkts alloc fail %d\n", __func__, idx, ret);
-    rte_pktmbuf_free_bulk(pkts_chain, bulk);
     s->stat_build_ret_code = -STI_FRAME_PKT_ALLOC_FAIL;
     return MT_TASKLET_ALL_DONE;
   }
 
-  if (send_r) {
-    ret = rte_pktmbuf_alloc_bulk(hdr_pool_r, pkts_r, bulk);
+  if (!s->tx_no_chain) {
+    ret = rte_pktmbuf_alloc_bulk(chain_pool, pkts_chain, bulk);
     if (ret < 0) {
-      dbg("%s(%d), pkts_r alloc fail %d\n", __func__, idx, ret);
+      dbg("%s(%d), pkts chain alloc fail %d\n", __func__, idx, ret);
       rte_pktmbuf_free_bulk(pkts, bulk);
-      rte_pktmbuf_free_bulk(pkts_chain, bulk);
       s->stat_build_ret_code = -STI_FRAME_PKT_ALLOC_FAIL;
       return MT_TASKLET_ALL_DONE;
+    }
+    if (send_r) {
+      ret = rte_pktmbuf_alloc_bulk(hdr_pool_r, pkts_r, bulk);
+      if (ret < 0) {
+        dbg("%s(%d), pkts_r alloc fail %d\n", __func__, idx, ret);
+        rte_pktmbuf_free_bulk(pkts, bulk);
+        rte_pktmbuf_free_bulk(pkts_chain, bulk);
+        s->stat_build_ret_code = -STI_FRAME_PKT_ALLOC_FAIL;
+        return MT_TASKLET_ALL_DONE;
+      }
     }
   }
 
   for (unsigned int i = 0; i < bulk; i++) {
     if (s->st20_pkt_idx >= s->st20_total_pkts) {
       s->stat_pkts_dummy++;
-      rte_pktmbuf_free(pkts_chain[i]);
+      if (!s->tx_no_chain) rte_pktmbuf_free(pkts_chain[i]);
       st_tx_mbuf_set_idx(pkts[i], ST_TX_DUMMY_PKT_IDX);
     } else {
-      tv_build_pkt(impl, s, pkts[i], pkts_chain[i]);
+      if (s->tx_no_chain)
+        tv_build_st20(s, pkts[i]);
+      else
+        tv_build_st20_chain(s, pkts[i], pkts_chain[i]);
       st_tx_mbuf_set_idx(pkts[i], s->st20_pkt_idx);
     }
     pacing_set_mbuf_time_stamp(pkts[i], pacing);
@@ -1191,13 +1495,25 @@ static int tv_tasklet_frame(struct mtl_main_impl* impl,
       if (s->st20_pkt_idx >= s->st20_total_pkts) {
         st_tx_mbuf_set_idx(pkts_r[i], ST_TX_DUMMY_PKT_IDX);
       } else {
-        tv_build_redundant(s, pkts_r[i], pkts[i], pkts_chain[i]);
+        if (s->tx_no_chain) {
+          pkts_r[i] = rte_pktmbuf_copy(pkts[i], hdr_pool_r, 0, UINT32_MAX);
+          if (pkts_r[i] == NULL) {
+            dbg("%s(%d), pkts_r alloc fail %d\n", __func__, idx, ret);
+            rte_pktmbuf_free_bulk(pkts, bulk);
+            rte_pktmbuf_free_bulk(pkts_r, bulk);
+            s->stat_build_ret_code = -STI_FRAME_PKT_ALLOC_FAIL;
+            s->st20_pkt_idx -= i; /* todo: revert all status */
+            return MT_TASKLET_ALL_DONE;
+          }
+          tv_update_redundant(s, pkts_r[i]);
+        } else
+          tv_build_st20_redundant_chain(s, pkts_r[i], pkts[i]);
         st_tx_mbuf_set_idx(pkts_r[i], s->st20_pkt_idx);
       }
       pacing_set_mbuf_time_stamp(pkts_r[i], pacing);
     }
 
-    pacing_foward_cursor(pacing); /* pkt foward */
+    pacing_forward_cursor(pacing); /* pkt forward */
     s->st20_pkt_idx++;
     s->stat_pkts_build++;
   }
@@ -1205,9 +1521,9 @@ static int tv_tasklet_frame(struct mtl_main_impl* impl,
   bool done = false;
   n = rte_ring_sp_enqueue_bulk(ring_p, (void**)&pkts[0], bulk, NULL);
   if (n == 0) {
-    for (unsigned int i = 0; i < bulk; i++) s->inflight[MT_SESSION_PORT_P][i] = pkts[i];
-    s->has_inflight[MT_SESSION_PORT_P] = true;
-    s->inflight_cnt[MT_SESSION_PORT_P]++;
+    for (unsigned int i = 0; i < bulk; i++) s->inflight[MTL_SESSION_PORT_P][i] = pkts[i];
+    s->has_inflight[MTL_SESSION_PORT_P] = true;
+    s->inflight_cnt[MTL_SESSION_PORT_P]++;
     s->stat_build_ret_code = -STI_FRAME_PKT_ENQUEUE_FAIL;
     done = true;
   }
@@ -1215,9 +1531,9 @@ static int tv_tasklet_frame(struct mtl_main_impl* impl,
     n = rte_ring_sp_enqueue_bulk(ring_r, (void**)&pkts_r[0], bulk, NULL);
     if (n == 0) {
       for (unsigned int i = 0; i < bulk; i++)
-        s->inflight[MT_SESSION_PORT_R][i] = pkts_r[i];
-      s->has_inflight[MT_SESSION_PORT_R] = true;
-      s->inflight_cnt[MT_SESSION_PORT_R]++;
+        s->inflight[MTL_SESSION_PORT_R][i] = pkts_r[i];
+      s->has_inflight[MTL_SESSION_PORT_R] = true;
+      s->inflight_cnt[MTL_SESSION_PORT_R]++;
       s->stat_build_ret_code = -STI_FRAME_PKT_R_ENQUEUE_FAIL;
       done = true;
     }
@@ -1230,6 +1546,11 @@ static int tv_tasklet_frame(struct mtl_main_impl* impl,
     s->st20_frame_stat = ST21_TX_STAT_WAIT_FRAME;
     s->st20_pkt_idx = 0;
     rte_atomic32_inc(&s->stat_frame_cnt);
+    if (s->tx_no_chain) {
+      /* trigger extbuf free cb since mbuf attach not used */
+      struct st_frame_trans* frame_info = &s->st20_frames[s->st20_frame_idx];
+      tv_frame_free_cb(frame_info->addr, frame_info);
+    }
 
     uint64_t frame_end_time = mt_get_tsc(impl);
     if (frame_end_time > pacing->tsc_time_cursor) {
@@ -1237,6 +1558,8 @@ static int tv_tasklet_frame(struct mtl_main_impl* impl,
       dbg("%s(%d), frame %d build time out %fus\n", __func__, idx, s->st20_frame_idx,
           (frame_end_time - pacing->tsc_time_cursor) / NS_PER_US);
     }
+    /* point to tsc time of next epoch */
+    pacing->tsc_time_cursor += pacing->frame_idle_time + pacing->tr_offset;
   }
 
   return done ? MT_TASKLET_ALL_DONE : MT_TASKLET_HAS_PENDING;
@@ -1252,9 +1575,9 @@ static int tv_tasklet_rtp(struct mtl_main_impl* impl,
   struct st_tx_video_pacing* pacing = &s->pacing;
   int ret;
   bool send_r = false;
-  struct rte_mempool* hdr_pool_p = s->mbuf_mempool_hdr[MT_SESSION_PORT_P];
+  struct rte_mempool* hdr_pool_p = s->mbuf_mempool_hdr[MTL_SESSION_PORT_P];
   struct rte_mempool* hdr_pool_r = NULL;
-  struct rte_ring* ring_p = s->ring[MT_SESSION_PORT_P];
+  struct rte_ring* ring_p = s->ring[MTL_SESSION_PORT_P];
   struct rte_ring* ring_r = NULL;
 
   if (rte_ring_full(ring_p)) {
@@ -1264,26 +1587,26 @@ static int tv_tasklet_rtp(struct mtl_main_impl* impl,
 
   if (s->ops.num_port > 1) {
     send_r = true;
-    hdr_pool_r = s->mbuf_mempool_hdr[MT_SESSION_PORT_R];
-    ring_r = s->ring[MT_SESSION_PORT_R];
+    hdr_pool_r = s->mbuf_mempool_hdr[MTL_SESSION_PORT_R];
+    ring_r = s->ring[MTL_SESSION_PORT_R];
   }
 
   /* check if any inflight pkts */
-  if (s->has_inflight[MT_SESSION_PORT_P]) {
-    n = rte_ring_sp_enqueue_bulk(ring_p, (void**)&s->inflight[MT_SESSION_PORT_P][0], bulk,
-                                 NULL);
+  if (s->has_inflight[MTL_SESSION_PORT_P]) {
+    n = rte_ring_sp_enqueue_bulk(ring_p, (void**)&s->inflight[MTL_SESSION_PORT_P][0],
+                                 bulk, NULL);
     if (n > 0) {
-      s->has_inflight[MT_SESSION_PORT_P] = false;
+      s->has_inflight[MTL_SESSION_PORT_P] = false;
     } else {
       s->stat_build_ret_code = -STI_RTP_INFLIGHT_ENQUEUE_FAIL;
       return MT_TASKLET_ALL_DONE;
     }
   }
-  if (send_r && s->has_inflight[MT_SESSION_PORT_R]) {
-    n = rte_ring_sp_enqueue_bulk(ring_r, (void**)&s->inflight[MT_SESSION_PORT_R][0], bulk,
-                                 NULL);
+  if (send_r && s->has_inflight[MTL_SESSION_PORT_R]) {
+    n = rte_ring_sp_enqueue_bulk(ring_r, (void**)&s->inflight[MTL_SESSION_PORT_R][0],
+                                 bulk, NULL);
     if (n > 0) {
-      s->has_inflight[MT_SESSION_PORT_R] = false;
+      s->has_inflight[MTL_SESSION_PORT_R] = false;
     } else {
       s->stat_build_ret_code = -STI_RTP_INFLIGHT_R_ENQUEUE_FAIL;
       return MT_TASKLET_ALL_DONE;
@@ -1334,17 +1657,17 @@ static int tv_tasklet_rtp(struct mtl_main_impl* impl,
   }
 
   for (unsigned int i = 0; i < pkts_bulk; i++) {
-    tv_build_rtp(impl, s, pkts[i], pkts_chain[i]);
+    tv_build_rtp_chain(impl, s, pkts[i], pkts_chain[i]);
     st_tx_mbuf_set_idx(pkts[i], s->st20_pkt_idx);
     pacing_set_mbuf_time_stamp(pkts[i], pacing);
 
     if (send_r) {
-      tv_build_redundant_rtp(s, pkts_r[i], pkts[i], pkts_chain[i]);
+      tv_build_rtp_redundant_chain(s, pkts_r[i], pkts[i]);
       st_tx_mbuf_set_idx(pkts_r[i], s->st20_pkt_idx);
       pacing_set_mbuf_time_stamp(pkts_r[i], pacing);
     }
 
-    pacing_foward_cursor(pacing); /* pkt foward */
+    pacing_forward_cursor(pacing); /* pkt forward */
     s->st20_pkt_idx++;
     s->stat_pkts_build++;
   }
@@ -1365,9 +1688,9 @@ static int tv_tasklet_rtp(struct mtl_main_impl* impl,
   bool done = false;
   n = rte_ring_sp_enqueue_bulk(ring_p, (void**)&pkts[0], bulk, NULL);
   if (n == 0) {
-    for (unsigned int i = 0; i < bulk; i++) s->inflight[MT_SESSION_PORT_P][i] = pkts[i];
-    s->has_inflight[MT_SESSION_PORT_P] = true;
-    s->inflight_cnt[MT_SESSION_PORT_P]++;
+    for (unsigned int i = 0; i < bulk; i++) s->inflight[MTL_SESSION_PORT_P][i] = pkts[i];
+    s->has_inflight[MTL_SESSION_PORT_P] = true;
+    s->inflight_cnt[MTL_SESSION_PORT_P]++;
     s->stat_build_ret_code = -STI_RTP_PKT_ENQUEUE_FAIL;
     done = true;
   }
@@ -1375,9 +1698,9 @@ static int tv_tasklet_rtp(struct mtl_main_impl* impl,
     n = rte_ring_sp_enqueue_bulk(ring_r, (void**)&pkts_r[0], bulk, NULL);
     if (n == 0) {
       for (unsigned int i = 0; i < bulk; i++)
-        s->inflight[MT_SESSION_PORT_R][i] = pkts_r[i];
-      s->has_inflight[MT_SESSION_PORT_R] = true;
-      s->inflight_cnt[MT_SESSION_PORT_R]++;
+        s->inflight[MTL_SESSION_PORT_R][i] = pkts_r[i];
+      s->has_inflight[MTL_SESSION_PORT_R] = true;
+      s->inflight_cnt[MTL_SESSION_PORT_R]++;
       s->stat_build_ret_code = -STI_RTP_PKT_R_ENQUEUE_FAIL;
       done = true;
     }
@@ -1396,10 +1719,10 @@ static int tv_tasklet_st22(struct mtl_main_impl* impl,
   struct st_tx_video_pacing* pacing = &s->pacing;
   int ret;
   bool send_r = false;
-  struct rte_mempool* hdr_pool_p = s->mbuf_mempool_hdr[MT_SESSION_PORT_P];
+  struct rte_mempool* hdr_pool_p = s->mbuf_mempool_hdr[MTL_SESSION_PORT_P];
   struct rte_mempool* hdr_pool_r = NULL;
   struct rte_mempool* chain_pool = s->mbuf_mempool_chain;
-  struct rte_ring* ring_p = s->ring[MT_SESSION_PORT_P];
+  struct rte_ring* ring_p = s->ring[MTL_SESSION_PORT_P];
   struct rte_ring* ring_r = NULL;
 
   if (rte_ring_full(ring_p)) {
@@ -1409,26 +1732,26 @@ static int tv_tasklet_st22(struct mtl_main_impl* impl,
 
   if (s->ops.num_port > 1) {
     send_r = true;
-    hdr_pool_r = s->mbuf_mempool_hdr[MT_SESSION_PORT_R];
-    ring_r = s->ring[MT_SESSION_PORT_R];
+    hdr_pool_r = s->mbuf_mempool_hdr[MTL_SESSION_PORT_R];
+    ring_r = s->ring[MTL_SESSION_PORT_R];
   }
 
   /* check if any inflight pkts */
-  if (s->has_inflight[MT_SESSION_PORT_P]) {
-    n = rte_ring_sp_enqueue_bulk(ring_p, (void**)&s->inflight[MT_SESSION_PORT_P][0], bulk,
-                                 NULL);
+  if (s->has_inflight[MTL_SESSION_PORT_P]) {
+    n = rte_ring_sp_enqueue_bulk(ring_p, (void**)&s->inflight[MTL_SESSION_PORT_P][0],
+                                 bulk, NULL);
     if (n > 0) {
-      s->has_inflight[MT_SESSION_PORT_P] = false;
+      s->has_inflight[MTL_SESSION_PORT_P] = false;
     } else {
       s->stat_build_ret_code = -STI_ST22_INFLIGHT_ENQUEUE_FAIL;
       return MT_TASKLET_ALL_DONE;
     }
   }
-  if (send_r && s->has_inflight[MT_SESSION_PORT_R]) {
-    n = rte_ring_sp_enqueue_bulk(ring_r, (void**)&s->inflight[MT_SESSION_PORT_R][0], bulk,
-                                 NULL);
+  if (send_r && s->has_inflight[MTL_SESSION_PORT_R]) {
+    n = rte_ring_sp_enqueue_bulk(ring_r, (void**)&s->inflight[MTL_SESSION_PORT_R][0],
+                                 bulk, NULL);
     if (n > 0) {
-      s->has_inflight[MT_SESSION_PORT_R] = false;
+      s->has_inflight[MTL_SESSION_PORT_R] = false;
     } else {
       s->stat_build_ret_code = -STI_ST22_INFLIGHT_R_ENQUEUE_FAIL;
       return MT_TASKLET_ALL_DONE;
@@ -1510,8 +1833,8 @@ static int tv_tasklet_st22(struct mtl_main_impl* impl,
   struct rte_mbuf* pkts_r[bulk];
 
   if (s->st20_pkt_idx >= st22_info->st22_total_pkts) { /* build pad */
-    struct rte_mbuf* pad = s->pad[MT_SESSION_PORT_P][ST20_PKT_TYPE_NORMAL];
-    struct rte_mbuf* pad_r = s->pad[MT_SESSION_PORT_R][ST20_PKT_TYPE_NORMAL];
+    struct rte_mbuf* pad = s->pad[MTL_SESSION_PORT_P][ST20_PKT_TYPE_NORMAL];
+    struct rte_mbuf* pad_r = s->pad[MTL_SESSION_PORT_R][ST20_PKT_TYPE_NORMAL];
 
     for (unsigned int i = 0; i < bulk; i++) {
       dbg("%s(%d), pad on pkt %d\n", __func__, s->idx, s->st20_pkt_idx);
@@ -1526,7 +1849,7 @@ static int tv_tasklet_st22(struct mtl_main_impl* impl,
         st_tx_mbuf_set_idx(pkts_r[i], s->st20_pkt_idx);
       }
 
-      pacing_foward_cursor(pacing); /* pkt foward */
+      pacing_forward_cursor(pacing); /* pkt forward */
       s->st20_pkt_idx++;
       s->stat_pkts_build++;
       s->stat_pkts_dummy++;
@@ -1534,29 +1857,30 @@ static int tv_tasklet_st22(struct mtl_main_impl* impl,
   } else {
     struct rte_mbuf* pkts_chain[bulk];
 
-    ret = rte_pktmbuf_alloc_bulk(chain_pool, pkts_chain, bulk);
-    if (ret < 0) {
-      dbg("%s(%d), pkts chain alloc fail %d\n", __func__, idx, ret);
-      s->stat_build_ret_code = -STI_ST22_PKT_ALLOC_FAIL;
-      return MT_TASKLET_ALL_DONE;
-    }
-
     ret = rte_pktmbuf_alloc_bulk(hdr_pool_p, pkts, bulk);
     if (ret < 0) {
       dbg("%s(%d), pkts alloc fail %d\n", __func__, idx, ret);
-      rte_pktmbuf_free_bulk(pkts_chain, bulk);
-      s->stat_build_ret_code = -STI_ST22_PKT_ALLOC_FAIL;
+      s->stat_build_ret_code = -STI_FRAME_PKT_ALLOC_FAIL;
       return MT_TASKLET_ALL_DONE;
     }
 
-    if (send_r) {
-      ret = rte_pktmbuf_alloc_bulk(hdr_pool_r, pkts_r, bulk);
+    if (!s->tx_no_chain) {
+      ret = rte_pktmbuf_alloc_bulk(chain_pool, pkts_chain, bulk);
       if (ret < 0) {
-        dbg("%s(%d), pkts_r alloc fail %d\n", __func__, idx, ret);
+        dbg("%s(%d), pkts chain alloc fail %d\n", __func__, idx, ret);
         rte_pktmbuf_free_bulk(pkts, bulk);
-        rte_pktmbuf_free_bulk(pkts_chain, bulk);
-        s->stat_build_ret_code = -STI_ST22_PKT_ALLOC_FAIL;
+        s->stat_build_ret_code = -STI_FRAME_PKT_ALLOC_FAIL;
         return MT_TASKLET_ALL_DONE;
+      }
+      if (send_r) {
+        ret = rte_pktmbuf_alloc_bulk(hdr_pool_r, pkts_r, bulk);
+        if (ret < 0) {
+          dbg("%s(%d), pkts_r alloc fail %d\n", __func__, idx, ret);
+          rte_pktmbuf_free_bulk(pkts, bulk);
+          rte_pktmbuf_free_bulk(pkts_chain, bulk);
+          s->stat_build_ret_code = -STI_FRAME_PKT_ALLOC_FAIL;
+          return MT_TASKLET_ALL_DONE;
+        }
       }
     }
 
@@ -1564,10 +1888,13 @@ static int tv_tasklet_st22(struct mtl_main_impl* impl,
       if (s->st20_pkt_idx >= st22_info->st22_total_pkts) {
         dbg("%s(%d), pad on pkt %d\n", __func__, s->idx, s->st20_pkt_idx);
         s->stat_pkts_dummy++;
-        rte_pktmbuf_free(pkts_chain[i]);
+        if (!s->tx_no_chain) rte_pktmbuf_free(pkts_chain[i]);
         st_tx_mbuf_set_idx(pkts[i], ST_TX_DUMMY_PKT_IDX);
       } else {
-        tv_build_st22(impl, s, pkts[i], pkts_chain[i]);
+        if (s->tx_no_chain)
+          tv_build_st22(s, pkts[i]);
+        else
+          tv_build_st22_chain(s, pkts[i], pkts_chain[i]);
         st_tx_mbuf_set_idx(pkts[i], s->st20_pkt_idx);
       }
       pacing_set_mbuf_time_stamp(pkts[i], pacing);
@@ -1576,13 +1903,25 @@ static int tv_tasklet_st22(struct mtl_main_impl* impl,
         if (s->st20_pkt_idx >= st22_info->st22_total_pkts) {
           st_tx_mbuf_set_idx(pkts_r[i], ST_TX_DUMMY_PKT_IDX);
         } else {
-          tv_build_st22_redundant(s, pkts_r[i], pkts[i], pkts_chain[i]);
+          if (s->tx_no_chain) {
+            pkts_r[i] = rte_pktmbuf_copy(pkts[i], hdr_pool_r, 0, UINT32_MAX);
+            if (pkts_r[i] == NULL) {
+              dbg("%s(%d), pkts_r alloc fail %d\n", __func__, idx, ret);
+              rte_pktmbuf_free_bulk(pkts, bulk);
+              rte_pktmbuf_free_bulk(pkts_r, bulk);
+              s->stat_build_ret_code = -STI_ST22_PKT_ALLOC_FAIL;
+              s->st20_pkt_idx -= i; /* todo: revert all status */
+              return MT_TASKLET_ALL_DONE;
+            }
+            tv_update_redundant(s, pkts_r[i]);
+          } else
+            tv_build_st22_redundant_chain(s, pkts_r[i], pkts[i]);
           st_tx_mbuf_set_idx(pkts_r[i], s->st20_pkt_idx);
         }
         pacing_set_mbuf_time_stamp(pkts_r[i], pacing);
       }
 
-      pacing_foward_cursor(pacing); /* pkt foward */
+      pacing_forward_cursor(pacing); /* pkt forward */
       s->st20_pkt_idx++;
       s->stat_pkts_build++;
     }
@@ -1591,9 +1930,9 @@ static int tv_tasklet_st22(struct mtl_main_impl* impl,
   bool done = false;
   n = rte_ring_sp_enqueue_bulk(ring_p, (void**)&pkts[0], bulk, NULL);
   if (n == 0) {
-    for (unsigned int i = 0; i < bulk; i++) s->inflight[MT_SESSION_PORT_P][i] = pkts[i];
-    s->has_inflight[MT_SESSION_PORT_P] = true;
-    s->inflight_cnt[MT_SESSION_PORT_P]++;
+    for (unsigned int i = 0; i < bulk; i++) s->inflight[MTL_SESSION_PORT_P][i] = pkts[i];
+    s->has_inflight[MTL_SESSION_PORT_P] = true;
+    s->inflight_cnt[MTL_SESSION_PORT_P]++;
     s->stat_build_ret_code = -STI_ST22_PKT_ENQUEUE_FAIL;
     done = true;
   }
@@ -1601,9 +1940,9 @@ static int tv_tasklet_st22(struct mtl_main_impl* impl,
     n = rte_ring_sp_enqueue_bulk(ring_r, (void**)&pkts_r[0], bulk, NULL);
     if (n == 0) {
       for (unsigned int i = 0; i < bulk; i++)
-        s->inflight[MT_SESSION_PORT_R][i] = pkts_r[i];
-      s->has_inflight[MT_SESSION_PORT_R] = true;
-      s->inflight_cnt[MT_SESSION_PORT_R]++;
+        s->inflight[MTL_SESSION_PORT_R][i] = pkts_r[i];
+      s->has_inflight[MTL_SESSION_PORT_R] = true;
+      s->inflight_cnt[MTL_SESSION_PORT_R]++;
       s->stat_build_ret_code = -STI_ST22_PKT_R_ENQUEUE_FAIL;
       done = true;
     }
@@ -1631,7 +1970,7 @@ static int tv_tasklet_st22(struct mtl_main_impl* impl,
 
 static int tvs_tasklet_handler(void* priv) {
   struct st_tx_video_sessions_mgr* mgr = priv;
-  struct mtl_main_impl* impl = mgr->parnet;
+  struct mtl_main_impl* impl = mgr->parent;
   struct st_tx_video_session_impl* s;
   int pending = MT_TASKLET_ALL_DONE;
 
@@ -1738,7 +2077,7 @@ static int tv_init_hw(struct mtl_main_impl* impl, struct st_tx_video_sessions_mg
     }
 
     if (false & mt_pmd_is_kernel(impl, port)) {
-      /* disable now, alwasy use no zc mempool for the flush pad */
+      /* disable now, always use no zc mempool for the flush pad */
       pad_mempool = s->mbuf_mempool_hdr[i];
     } else {
       pad_mempool = mt_get_tx_mempool(impl, port);
@@ -1753,6 +2092,8 @@ static int tv_init_hw(struct mtl_main_impl* impl, struct st_tx_video_sessions_mg
       }
       s->pad[i][j] = pad;
     }
+
+    s->queue_burst_pkts[i] = mt_if_nb_tx_burst(impl, port);
   }
 
   return 0;
@@ -1765,8 +2106,12 @@ static int tv_mempool_free(struct st_tx_video_session_impl* s) {
     ret = mt_mempool_free(s->mbuf_mempool_chain);
     if (ret >= 0) s->mbuf_mempool_chain = NULL;
   }
+  if (s->mbuf_mempool_copy_chain && !s->tx_mono_pool) {
+    ret = mt_mempool_free(s->mbuf_mempool_copy_chain);
+    if (ret >= 0) s->mbuf_mempool_copy_chain = NULL;
+  }
 
-  for (int i = 0; i < MT_SESSION_PORT_MAX; i++) {
+  for (int i = 0; i < MTL_SESSION_PORT_MAX; i++) {
     if (s->mbuf_mempool_hdr[i]) {
       if (!s->mbuf_mempool_reuse_rx[i] && !s->tx_mono_pool)
         ret = mt_mempool_free(s->mbuf_mempool_hdr[i]);
@@ -1801,13 +2146,9 @@ static int tv_mempool_init(struct mtl_main_impl* impl,
   uint16_t hdr_room_size = 0;
   uint16_t chain_room_size = 0;
 
-  if (!tv_has_chain_buf(s)) {
-    /* no chain buffer support in the driver */
+  if (s->tx_no_chain) {
+    /* do not use mbuf chain, use same mbuf for hdr+payload */
     hdr_room_size = s->st20_pkt_size;
-    if (ops->type == ST20_TYPE_RTP_LEVEL)
-      chain_room_size = s->rtp_pkt_max_size;
-    else
-      chain_room_size = 0;
   } else if (s->st22_info) {
     hdr_room_size = sizeof(struct st22_rfc9134_video_hdr);
     /* attach extbuf used, only placeholder mbuf */
@@ -1821,14 +2162,13 @@ static int tv_mempool_init(struct mtl_main_impl* impl,
       hdr_room_size += sizeof(struct st20_rfc4175_extra_rtp_hdr);
     /* attach extbuf used, only placeholder mbuf */
     chain_room_size = 0;
-    if (s->st20_linesize > s->st20_bytes_in_line) { /* lines have padding */
-      if (s->ops.packing != ST20_PACKING_GPM_SL) /* and there is packet acrossing lines */
-        chain_room_size = s->st20_pkt_len;
-    }
+    if (impl->iova_mode == RTE_IOVA_PA) /* need copy for cross page pkts*/
+      chain_room_size = s->st20_pkt_len;
   }
 
   for (int i = 0; i < num_port; i++) {
     port = mt_port_logic2phy(s->port_maps, i);
+    /* allocate header mbuf pool */
     if (s->mbuf_mempool_reuse_rx[i]) {
       s->mbuf_mempool_hdr[i] = NULL; /* reuse rx mempool for zero copy */
     } else if (s->tx_mono_pool) {
@@ -1854,25 +2194,43 @@ static int tv_mempool_init(struct mtl_main_impl* impl,
     }
   }
 
-  port = mt_port_logic2phy(s->port_maps, MT_SESSION_PORT_P);
-  n = mt_if_nb_tx_desc(impl, port) + s->ring_count;
-  if (ops->type == ST20_TYPE_RTP_LEVEL) n += ops->rtp_ring_size;
+  /* allocate payload(chain) mbuf pool on primary port */
+  if (!s->tx_no_chain) {
+    port = mt_port_logic2phy(s->port_maps, MTL_SESSION_PORT_P);
+    n = mt_if_nb_tx_desc(impl, port) + s->ring_count;
+    if (ops->type == ST20_TYPE_RTP_LEVEL) n += ops->rtp_ring_size;
 
-  if (s->tx_mono_pool) {
-    s->mbuf_mempool_chain = mt_get_tx_mempool(impl, port);
-    info("%s(%d), use tx mono chain mempool(%p)\n", __func__, idx, s->mbuf_mempool_chain);
-  } else if (s->mbuf_mempool_chain) {
-    warn("%s(%d), use previous chain mempool\n", __func__, idx);
-  } else {
-    char pool_name[32];
-    snprintf(pool_name, 32, "TXVIDEOCHAIN-M%d-R%d", mgr->idx, idx);
-    struct rte_mempool* mbuf_pool = mt_mempool_create(
-        impl, port, pool_name, n, MT_MBUF_CACHE_SIZE, 0, chain_room_size);
-    if (!mbuf_pool) {
-      tv_mempool_free(s);
-      return -ENOMEM;
+    if (s->tx_mono_pool) {
+      s->mbuf_mempool_chain = mt_get_tx_mempool(impl, port);
+      info("%s(%d), use tx mono chain mempool(%p)\n", __func__, idx,
+           s->mbuf_mempool_chain);
+    } else {
+      char pool_name[32];
+      snprintf(pool_name, 32, "TXVIDEOCHAIN-M%d-R%d", mgr->idx, idx);
+      struct rte_mempool* mbuf_pool = mt_mempool_create(
+          impl, port, pool_name, n, MT_MBUF_CACHE_SIZE, 0, chain_room_size);
+      if (!mbuf_pool) {
+        tv_mempool_free(s);
+        return -ENOMEM;
+      }
+      s->mbuf_mempool_chain = mbuf_pool;
+
+      /* has copy (not attach extbuf) and chain mbuf, create a special mempool */
+      if (s->st20_linesize > s->st20_bytes_in_line &&
+          s->ops.packing != ST20_PACKING_GPM_SL) {
+        chain_room_size = s->st20_pkt_len;
+        n /= s->st20_total_pkts / s->st20_pkt_info[ST20_PKT_TYPE_EXTRA].number;
+        char pool_name[32];
+        snprintf(pool_name, 32, "TXVIDEOCOPYCHAIN-M%d-R%d", mgr->idx, idx);
+        struct rte_mempool* mbuf_pool = mt_mempool_create(
+            impl, port, pool_name, n, MT_MBUF_CACHE_SIZE, 0, chain_room_size);
+        if (!mbuf_pool) {
+          tv_mempool_free(s);
+          return -ENOMEM;
+        }
+        s->mbuf_mempool_copy_chain = mbuf_pool;
+      }
     }
-    s->mbuf_mempool_chain = mbuf_pool;
   }
 
   return 0;
@@ -1885,7 +2243,7 @@ static int tv_init_packet_ring(struct mtl_main_impl* impl,
   struct rte_ring* ring;
   unsigned int flags, count = s->ops.rtp_ring_size;
   int mgr_idx = mgr->idx, idx = s->idx;
-  enum mtl_port port = mt_port_logic2phy(s->port_maps, MT_SESSION_PORT_P);
+  enum mtl_port port = mt_port_logic2phy(s->port_maps, MTL_SESSION_PORT_P);
 
   snprintf(ring_name, 32, "TX-VIDEO-PACKET-RING-M%d-R%d", mgr_idx, idx);
   flags = RING_F_SP_ENQ | RING_F_SC_DEQ; /* single-producer and single-consumer */
@@ -2129,7 +2487,7 @@ static int tv_attach(struct mtl_main_impl* impl, struct st_tx_video_sessions_mgr
                      enum mt_handle_type s_type, struct st22_tx_ops* st22_frame_ops) {
   int ret;
   int idx = s->idx, num_port = ops->num_port;
-  char* ports[MT_SESSION_PORT_MAX];
+  char* ports[MTL_SESSION_PORT_MAX];
 
   for (int i = 0; i < num_port; i++) ports[i] = ops->port[i];
   ret = mt_build_port_map(impl, ports, s->port_maps, num_port);
@@ -2193,11 +2551,15 @@ static int tv_attach(struct mtl_main_impl* impl, struct st_tx_video_sessions_mgr
   s->ops = *ops;
   s->s_type = s_type;
   for (int i = 0; i < num_port; i++) {
-    s->st20_src_port[i] = (ops->udp_port[i]) ? (ops->udp_port[i]) : (10000 + idx);
-    s->st20_dst_port[i] = s->st20_src_port[i];
+    s->st20_dst_port[i] = (ops->udp_port[i]) ? (ops->udp_port[i]) : (10000 + idx);
+    if (mt_random_src_port(impl))
+      s->st20_src_port[i] = mt_random_port(s->st20_dst_port[i]);
+    else
+      s->st20_src_port[i] =
+          (ops->udp_src_port[i]) ? (ops->udp_src_port[i]) : s->st20_dst_port[i];
     enum mtl_port port = mt_port_logic2phy(s->port_maps, i);
     s->eth_ipv4_cksum_offload[i] = mt_if_has_offload_ipv4_cksum(impl, port);
-    s->eth_has_chain[i] = mt_if_has_chain_buff(impl, port);
+    s->eth_has_chain[i] = mt_if_has_multi_seg(impl, port);
     if (mt_pmd_is_kernel(impl, port) && mt_has_af_xdp_zc(impl)) {
       /* enable zero copy for tx */
       s->mbuf_mempool_reuse_rx[i] = true;
@@ -2206,6 +2568,9 @@ static int tv_attach(struct mtl_main_impl* impl, struct st_tx_video_sessions_mgr
     }
   }
   s->tx_mono_pool = mt_has_tx_mono_pool(impl);
+  /* manually disable chain or any port can't support chain */
+  s->tx_no_chain = mt_has_tx_no_chain(impl) || !tv_has_chain_buf(s);
+  s->multi_src_port = mt_multi_src_port(impl);
   s->st20_ipv4_packet_id = 0;
 
   s->ring_count = ST_TX_VIDEO_SESSIONS_RING_SIZE;
@@ -2284,7 +2649,7 @@ static int tv_attach(struct mtl_main_impl* impl, struct st_tx_video_sessions_mgr
        ops->type, ops->flags);
   info("%s(%d), w %u h %u fmt %s packing %d pt %d, pacing way: %s\n", __func__, idx,
        ops->width, ops->height, st20_frame_fmt_name(ops->fmt), ops->packing,
-       ops->payload_type, st_tx_pacing_way_name(s->pacing_way[MT_SESSION_PORT_P]));
+       ops->payload_type, st_tx_pacing_way_name(s->pacing_way[MTL_SESSION_PORT_P]));
   return 0;
 }
 
@@ -2365,6 +2730,11 @@ static void tv_stat(struct st_tx_video_sessions_mgr* mgr,
            s->stat_user_busy);
     s->stat_user_busy = 0;
   }
+  if (s->stat_tx_done_cleanup) {
+    notice("TX_VIDEO_SESSION(%d,%d): tx done for cleanup %u\n", m_idx, idx,
+           s->stat_tx_done_cleanup);
+    s->stat_tx_done_cleanup = 0;
+  }
   if (s->stat_lines_not_ready) {
     notice("TX_VIDEO_SESSION(%d,%d): query new lines but app not ready %u\n", m_idx, idx,
            s->stat_lines_not_ready);
@@ -2375,10 +2745,16 @@ static void tv_stat(struct st_tx_video_sessions_mgr* mgr,
            s->stat_vsync_mismatch);
     s->stat_vsync_mismatch = 0;
   }
+  if (s->stat_pkts_chain_realloc_fail) {
+    notice("TX_VIDEO_SESSION(%d,%d): chain pkt realloc fail cnt %u\n", m_idx, idx,
+           s->stat_pkts_chain_realloc_fail);
+    notice("TX_VIDEO_SESSION(%d,%d): SERIOUS MEMORY ISSUE!\n", m_idx, idx);
+    s->stat_pkts_chain_realloc_fail = 0;
+  }
   if (frame_cnt <= 0) {
     warn("TX_VIDEO_SESSION(%d,%d:%s): build ret %d, trs ret %d:%d\n", m_idx, idx,
-         s->ops_name, s->stat_build_ret_code, s->stat_trs_ret_code[MT_SESSION_PORT_P],
-         s->stat_trs_ret_code[MT_SESSION_PORT_R]);
+         s->ops_name, s->stat_build_ret_code, s->stat_trs_ret_code[MTL_SESSION_PORT_P],
+         s->stat_trs_ret_code[MTL_SESSION_PORT_R]);
   }
 
   /* check frame busy stat */
@@ -2416,7 +2792,7 @@ static struct st_tx_video_session_impl* tv_mgr_attach(
     struct st_tx_video_sessions_mgr* mgr, struct st20_tx_ops* ops,
     enum mt_handle_type s_type, struct st22_tx_ops* st22_frame_ops) {
   int midx = mgr->idx;
-  struct mtl_main_impl* impl = mgr->parnet;
+  struct mtl_main_impl* impl = mgr->parent;
   int ret;
   struct st_tx_video_session_impl* s;
 
@@ -2465,7 +2841,7 @@ static int tv_mgr_detach(struct st_tx_video_sessions_mgr* mgr,
     return -EIO;
   }
 
-  tv_detach(mgr->parnet, mgr, s);
+  tv_detach(mgr->parent, mgr, s);
   mgr->sessions[idx] = NULL;
   mt_rte_free(s);
 
@@ -2485,7 +2861,7 @@ static int tv_mgr_init(struct mtl_main_impl* impl, struct mt_sch_impl* sch,
   RTE_BUILD_BUG_ON(sizeof(struct st22_rfc9134_video_hdr) != 58);
   RTE_BUILD_BUG_ON(sizeof(struct st22_boxes) != 60);
 
-  mgr->parnet = impl;
+  mgr->parent = impl;
   mgr->idx = idx;
 
   for (i = 0; i < ST_SCH_MAX_TX_VIDEO_SESSIONS; i++) {
@@ -2534,7 +2910,7 @@ static int tv_mgr_uinit(struct st_tx_video_sessions_mgr* mgr) {
 
 static int tv_mgr_update(struct st_tx_video_sessions_mgr* mgr) {
   int max_idx = 0;
-  struct mtl_main_impl* impl = mgr->parnet;
+  struct mtl_main_impl* impl = mgr->parent;
   uint64_t sleep_us = mt_sch_default_sleep_us(impl);
   struct st_tx_video_session_impl* s;
 
@@ -2614,7 +2990,7 @@ static int tv_ops_check(struct st20_tx_ops* ops) {
   int num_ports = ops->num_port, ret;
   uint8_t* ip;
 
-  if ((num_ports > MTL_PORT_MAX) || (num_ports <= 0)) {
+  if ((num_ports > MTL_SESSION_PORT_MAX) || (num_ports <= 0)) {
     err("%s, invalid num_ports %d\n", __func__, num_ports);
     return -EINVAL;
   }
@@ -2682,7 +3058,7 @@ static int tv_st22_ops_check(struct st22_tx_ops* ops) {
   int num_ports = ops->num_port, ret;
   uint8_t* ip;
 
-  if ((num_ports > MTL_PORT_MAX) || (num_ports <= 0)) {
+  if ((num_ports > MTL_SESSION_PORT_MAX) || (num_ports <= 0)) {
     err("%s, invalid num_ports %d\n", __func__, num_ports);
     return -EINVAL;
   }
@@ -2816,7 +3192,7 @@ st20_tx_handle st20_tx_create(mtl_handle mt, struct st20_tx_ops* ops) {
   tv_mgr_update(&sch->tx_video_mgr);
   mt_pthread_mutex_unlock(&sch->tx_video_mgr_mutex);
 
-  s_impl->parnet = impl;
+  s_impl->parent = impl;
   s_impl->type = MT_HANDLE_TX_VIDEO;
   s_impl->sch = sch;
   s_impl->impl = s;
@@ -3049,7 +3425,7 @@ int st20_tx_free(st20_tx_handle handle) {
     return -EIO;
   }
 
-  impl = s_impl->parnet;
+  impl = s_impl->parent;
   sch = s_impl->sch;
   s = s_impl->impl;
   idx = s->idx;
@@ -3058,8 +3434,7 @@ int st20_tx_free(st20_tx_handle handle) {
   mt_pthread_mutex_lock(&sch->tx_video_mgr_mutex);
   ret = tv_mgr_detach(&sch->tx_video_mgr, s);
   mt_pthread_mutex_unlock(&sch->tx_video_mgr_mutex);
-  if (ret < 0)
-    err("%s(%d,%d), st_tx_sessions_mgr_deattach fail\n", __func__, sch_idx, idx);
+  if (ret < 0) err("%s(%d,%d), st_tx_sessions_mgr_detach fail\n", __func__, sch_idx, idx);
 
   ret = mt_sch_put(sch, s_impl->quota_mbs);
   if (ret < 0) err("%s(%d, %d), mt_sch_put fail\n", __func__, sch_idx, idx);
@@ -3146,21 +3521,21 @@ st22_tx_handle st22_tx_create(mtl_handle mt, struct st22_tx_ops* ops) {
   st20_ops.name = ops->name;
   st20_ops.priv = ops->priv;
   st20_ops.num_port = ops->num_port;
-  memcpy(st20_ops.dip_addr[MTL_PORT_P], ops->dip_addr[MTL_PORT_P], MTL_IP_ADDR_LEN);
-  strncpy(st20_ops.port[MTL_PORT_P], ops->port[MTL_PORT_P], MTL_PORT_MAX_LEN);
-  st20_ops.udp_port[MTL_PORT_P] = ops->udp_port[MTL_PORT_P];
+  for (int i = 0; i < ops->num_port; i++) {
+    memcpy(st20_ops.dip_addr[i], ops->dip_addr[i], MTL_IP_ADDR_LEN);
+    strncpy(st20_ops.port[i], ops->port[i], MTL_PORT_MAX_LEN);
+    st20_ops.udp_src_port[i] = ops->udp_src_port[i];
+    st20_ops.udp_port[i] = ops->udp_port[i];
+  }
   if (ops->flags & ST22_TX_FLAG_USER_P_MAC) {
-    memcpy(&st20_ops.tx_dst_mac[MTL_PORT_P][0], &ops->tx_dst_mac[MTL_PORT_P][0],
-           MTL_MAC_ADDR_LEN);
+    memcpy(&st20_ops.tx_dst_mac[MTL_SESSION_PORT_P][0],
+           &ops->tx_dst_mac[MTL_SESSION_PORT_P][0], MTL_MAC_ADDR_LEN);
     st20_ops.flags |= ST20_TX_FLAG_USER_P_MAC;
   }
   if (ops->num_port > 1) {
-    memcpy(st20_ops.dip_addr[MTL_PORT_R], ops->dip_addr[MTL_PORT_R], MTL_IP_ADDR_LEN);
-    strncpy(st20_ops.port[MTL_PORT_R], ops->port[MTL_PORT_R], MTL_PORT_MAX_LEN);
-    st20_ops.udp_port[MTL_PORT_R] = ops->udp_port[MTL_PORT_R];
     if (ops->flags & ST22_TX_FLAG_USER_R_MAC) {
-      memcpy(&st20_ops.tx_dst_mac[MTL_PORT_R][0], &ops->tx_dst_mac[MTL_PORT_R][0],
-             MTL_MAC_ADDR_LEN);
+      memcpy(&st20_ops.tx_dst_mac[MTL_SESSION_PORT_R][0],
+             &ops->tx_dst_mac[MTL_SESSION_PORT_R][0], MTL_MAC_ADDR_LEN);
       st20_ops.flags |= ST20_TX_FLAG_USER_R_MAC;
     }
   }
@@ -3198,7 +3573,7 @@ st22_tx_handle st22_tx_create(mtl_handle mt, struct st22_tx_ops* ops) {
     return NULL;
   }
 
-  s_impl->parnet = impl;
+  s_impl->parent = impl;
   s_impl->type = MT_ST22_HANDLE_TX_VIDEO;
   s_impl->sch = sch;
   s_impl->impl = s;
@@ -3223,7 +3598,7 @@ int st22_tx_free(st22_tx_handle handle) {
     return -EIO;
   }
 
-  impl = s_impl->parnet;
+  impl = s_impl->parent;
   sch = s_impl->sch;
   s = s_impl->impl;
   idx = s->idx;
@@ -3232,8 +3607,7 @@ int st22_tx_free(st22_tx_handle handle) {
   mt_pthread_mutex_lock(&sch->tx_video_mgr_mutex);
   ret = tv_mgr_detach(&sch->tx_video_mgr, s);
   mt_pthread_mutex_unlock(&sch->tx_video_mgr_mutex);
-  if (ret < 0)
-    err("%s(%d,%d), st_tx_sessions_mgr_deattach fail\n", __func__, sch_idx, idx);
+  if (ret < 0) err("%s(%d,%d), st_tx_sessions_mgr_detach fail\n", __func__, sch_idx, idx);
 
   ret = mt_sch_put(sch, s_impl->quota_mbs);
   if (ret < 0) err("%s(%d, %d), mt_sch_put fail\n", __func__, sch_idx, idx);

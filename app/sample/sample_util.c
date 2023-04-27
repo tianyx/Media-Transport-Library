@@ -7,6 +7,11 @@
 #include <getopt.h>
 #include <inttypes.h>
 
+/* include "struct sockaddr_in" define before include mudp_sockfd_api */
+// clang-format off
+#include <mtl/mudp_sockfd_internal.h>
+// clang-format on
+
 enum sample_args_cmd {
   SAMPLE_ARG_UNKNOWN = 0,
 
@@ -18,6 +23,8 @@ enum sample_args_cmd {
   SAMPLE_ARG_R_RX_IP,
   SAMPLE_ARG_P_SIP,
   SAMPLE_ARG_R_SIP,
+  SAMPLE_ARG_UDP_PORT,
+  SAMPLE_ARG_FPS,
   SAMPLE_ARG_P_FWD_IP,
   SAMPLE_ARG_LOG_LEVEL,
   SAMPLE_ARG_DEV_AUTO_START,
@@ -31,6 +38,8 @@ enum sample_args_cmd {
   SAMPLE_ARG_P_GATEWAY,
   SAMPLE_ARG_R_GATEWAY,
   SAMPLE_ARG_PTP_TSC,
+  SAMPLE_ARG_UDP_LCORE,
+  SAMPLE_ARG_RSS_MODE,
 
   SAMPLE_ARG_TX_VIDEO_URL = 0x200,
   SAMPLE_ARG_RX_VIDEO_URL,
@@ -41,6 +50,9 @@ enum sample_args_cmd {
   SAMPLE_ARG_EXT_FRAME,
   SAMPLE_ARG_ST22_CODEC,
   SAMPLE_ARG_ST22_FRAME_FMT,
+  SAMPLE_ARG_GDDR_PA,
+  SAMPLE_ARG_RX_DUMP,
+  SAMPLE_ARG_USE_CPU_COPY,
 
   SAMPLE_ARG_UDP_MODE = 0x300,
   SAMPLE_ARG_UDP_LEN,
@@ -58,6 +70,8 @@ static struct option sample_args_options[] = {
     {"r_rx_ip", required_argument, 0, SAMPLE_ARG_R_RX_IP},
     {"p_sip", required_argument, 0, SAMPLE_ARG_P_SIP},
     {"r_sip", required_argument, 0, SAMPLE_ARG_R_SIP},
+    {"udp_port", required_argument, 0, SAMPLE_ARG_UDP_PORT},
+    {"fps", required_argument, 0, SAMPLE_ARG_FPS},
     {"p_fwd_ip", required_argument, 0, SAMPLE_ARG_P_FWD_IP},
     {"sessions_cnt", required_argument, 0, SAMPLE_ARG_SESSIONS_CNT},
     {"log_level", required_argument, 0, SAMPLE_ARG_LOG_LEVEL},
@@ -72,6 +86,8 @@ static struct option sample_args_options[] = {
     {"p_gateway", required_argument, 0, SAMPLE_ARG_P_GATEWAY},
     {"r_gateway", required_argument, 0, SAMPLE_ARG_R_GATEWAY},
     {"ptp_tsc", no_argument, 0, SAMPLE_ARG_PTP_TSC},
+    {"udp_lcore", no_argument, 0, SAMPLE_ARG_UDP_LCORE},
+    {"rss_mode", required_argument, 0, SAMPLE_ARG_RSS_MODE},
 
     {"tx_url", required_argument, 0, SAMPLE_ARG_TX_VIDEO_URL},
     {"rx_url", required_argument, 0, SAMPLE_ARG_RX_VIDEO_URL},
@@ -85,6 +101,9 @@ static struct option sample_args_options[] = {
     {"udp_mode", required_argument, 0, SAMPLE_ARG_UDP_MODE},
     {"udp_len", required_argument, 0, SAMPLE_ARG_UDP_LEN},
     {"udp_tx_bps_g", required_argument, 0, SAMPLE_ARG_UDP_TX_BPS_G},
+    {"gddr_pa", required_argument, 0, SAMPLE_ARG_GDDR_PA},
+    {"use_cpu_copy", no_argument, 0, SAMPLE_ARG_USE_CPU_COPY},
+    {"rx_dump", no_argument, 0, SAMPLE_ARG_RX_DUMP},
 
     {0, 0, 0, 0}};
 
@@ -132,6 +151,27 @@ static int _sample_parse_args(struct st_sample_context* ctx, int argc, char** ar
         break;
       case SAMPLE_ARG_R_SIP:
         inet_pton(AF_INET, optarg, mtl_r_sip_addr(p));
+        break;
+      case SAMPLE_ARG_UDP_PORT:
+        ctx->udp_port = atoi(optarg);
+        break;
+      case SAMPLE_ARG_FPS:
+        if (!strcmp(optarg, "59.94"))
+          ctx->fps = ST_FPS_P59_94;
+        else if (!strcmp(optarg, "50"))
+          ctx->fps = ST_FPS_P50;
+        else if (!strcmp(optarg, "60"))
+          ctx->fps = ST_FPS_P60;
+        else if (!strcmp(optarg, "30"))
+          ctx->fps = ST_FPS_P30;
+        else if (!strcmp(optarg, "29.97"))
+          ctx->fps = ST_FPS_P29_97;
+        else if (!strcmp(optarg, "25"))
+          ctx->fps = ST_FPS_P25;
+        else if (!strcmp(optarg, "24"))
+          ctx->fps = ST_FPS_P24;
+        else
+          err("%s, unknow fps %s\n", __func__, optarg);
         break;
       case SAMPLE_ARG_P_TX_IP:
         inet_pton(AF_INET, optarg, ctx->tx_dip_addr[MTL_PORT_P]);
@@ -182,6 +222,25 @@ static int _sample_parse_args(struct st_sample_context* ctx, int argc, char** ar
         break;
       case SAMPLE_ARG_PTP_TSC:
         p->flags |= MTL_FLAG_PTP_SOURCE_TSC;
+        break;
+      case SAMPLE_ARG_UDP_LCORE:
+        p->flags |= MTL_FLAG_UDP_LCORE;
+        break;
+      case SAMPLE_ARG_RSS_MODE:
+        if (!strcmp(optarg, "l3"))
+          p->rss_mode = MTL_RSS_MODE_L3;
+        else if (!strcmp(optarg, "l3_l4"))
+          p->rss_mode = MTL_RSS_MODE_L3_L4;
+        else if (!strcmp(optarg, "l3_l4_dst_port_only"))
+          p->rss_mode = MTL_RSS_MODE_L3_L4_DP_ONLY;
+        else if (!strcmp(optarg, "l3_da_l4_dst_port_only"))
+          p->rss_mode = MTL_RSS_MODE_L3_DA_L4_DP_ONLY;
+        else if (!strcmp(optarg, "l4_dst_port_only"))
+          p->rss_mode = MTL_RSS_MODE_L4_DP_ONLY;
+        else if (!strcmp(optarg, "none"))
+          p->rss_mode = MTL_RSS_MODE_NONE;
+        else
+          err("%s, unknow rss mode %s\n", __func__, optarg);
         break;
       case SAMPLE_ARG_QUEUES_CNT:
         p->rx_queues_cnt_max = atoi(optarg);
@@ -249,6 +308,15 @@ static int _sample_parse_args(struct st_sample_context* ctx, int argc, char** ar
         break;
       case SAMPLE_ARG_UDP_LEN:
         ctx->udp_len = atoi(optarg);
+        break;
+      case SAMPLE_ARG_GDDR_PA:
+        ctx->gddr_pa = strtol(optarg, NULL, 0);
+        break;
+      case SAMPLE_ARG_RX_DUMP:
+        ctx->rx_dump = true;
+        break;
+      case SAMPLE_ARG_USE_CPU_COPY:
+        ctx->use_cpu_copy = true;
         break;
       case '?':
         break;
@@ -422,4 +490,30 @@ void fill_rfc4175_422_12_pg2_data(struct st20_rfc4175_422_12_pg2_be* data, int w
     cr++;
     y1 += 2;
   }
+}
+
+int ufd_override_check(struct st_sample_context* ctx) {
+  struct mufd_override_params override;
+  bool has_override = false;
+
+  memset(&override, 0, sizeof(override));
+  override.log_level = MTL_LOG_LEVEL_INFO;
+  /* check if user has assigned extra arguments */
+  if (ctx->param.log_level != MTL_LOG_LEVEL_INFO) {
+    has_override = true;
+    override.log_level = ctx->param.log_level;
+  }
+  if (ctx->param.flags & MTL_FLAG_UDP_LCORE) {
+    has_override = true;
+    override.lcore_mode = true;
+  }
+  if (ctx->param.flags & MTL_FLAG_SHARED_QUEUE) {
+    has_override = true;
+    override.shared_queue = true;
+  }
+  if (has_override) {
+    mufd_commit_override_params(&override);
+  }
+
+  return 0;
 }

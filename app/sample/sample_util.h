@@ -89,6 +89,7 @@ struct st_sample_context {
   uint32_t sessions; /* number of sessions */
   bool ext_frame;
   bool hdr_split;
+  bool rx_dump;
 
   char logo_url[ST_SAMPLE_URL_MAX_LEN];
   uint32_t logo_width;
@@ -104,6 +105,11 @@ struct st_sample_context {
 
   bool exit;
   void (*sig_handler)(int signo);
+
+  /* the PA of gpu PCIE bar which connected with GDDR */
+  off_t gddr_pa;
+  off_t gddr_offset;
+  bool use_cpu_copy;
 };
 
 int sample_parse_args(struct st_sample_context* ctx, int argc, char** argv, bool tx,
@@ -128,5 +134,7 @@ static inline uint64_t sample_get_monotonic_time() {
   clock_gettime(ST_CLOCK_MONOTONIC_ID, &ts);
   return ((uint64_t)ts.tv_sec * NS_PER_S) + ts.tv_nsec;
 }
+
+int ufd_override_check(struct st_sample_context* ctx);
 
 #endif

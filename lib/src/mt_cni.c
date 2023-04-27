@@ -6,24 +6,30 @@
 
 #include "mt_arp.h"
 #include "mt_dev.h"
+#include "mt_dhcp.h"
 #include "mt_kni.h"
 // #define DEBUG
+#include "mt_dhcp.h"
 #include "mt_log.h"
 #include "mt_ptp.h"
+#include "mt_rss.h"
 #include "mt_sch.h"
 #include "mt_shared_queue.h"
+#include "mt_shared_rss.h"
 #include "mt_tap.h"
 #include "mt_util.h"
 
 static int cni_rx_handle(struct mtl_main_impl* impl, struct rte_mbuf* m,
                          enum mtl_port port) {
   struct mt_ptp_impl* ptp = mt_get_ptp(impl, port);
+  struct mt_dhcp_impl* dhcp = mt_get_dhcp(impl, port);
   struct rte_ether_hdr* eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr*);
   uint16_t ether_type, src_port;
   struct rte_vlan_hdr* vlan_header;
   bool vlan = false;
   struct mt_ptp_header* ptp_hdr;
   struct rte_arp_hdr* arp_hdr;
+  struct mt_dhcp_hdr* dhcp_hdr;
   struct mt_ptp_ipv4_udp* ipv4_hdr;
   size_t hdr_offset = sizeof(struct rte_ether_hdr);
 
@@ -53,9 +59,13 @@ static int cni_rx_handle(struct mtl_main_impl* impl, struct rte_mbuf* m,
       ipv4_hdr = rte_pktmbuf_mtod_offset(m, struct mt_ptp_ipv4_udp*, hdr_offset);
       src_port = ntohs(ipv4_hdr->udp.src_port);
       hdr_offset += sizeof(struct mt_ptp_ipv4_udp);
-      if ((src_port == MT_PTP_UDP_EVENT_PORT) || (src_port == MT_PTP_UDP_GEN_PORT)) {
+      if (ptp && (src_port == MT_PTP_UDP_EVENT_PORT ||
+                  src_port == MT_PTP_UDP_GEN_PORT)) { /* ptp pkt*/
         ptp_hdr = rte_pktmbuf_mtod_offset(m, struct mt_ptp_header*, hdr_offset);
         mt_ptp_parse(ptp, ptp_hdr, vlan, MT_PTP_L4, m->timesync, ipv4_hdr);
+      } else if (dhcp && src_port == MT_DHCP_UDP_SERVER_PORT) { /* dhcp pkt */
+        dhcp_hdr = rte_pktmbuf_mtod_offset(m, struct mt_dhcp_hdr*, hdr_offset);
+        mt_dhcp_parse(impl, dhcp_hdr, port);
       }
       break;
     default:
@@ -78,7 +88,7 @@ static int cni_traffic(struct mtl_main_impl* impl) {
     ptp = mt_get_ptp(impl, i);
 
     /* rx from ptp rx queue */
-    if (ptp->rx_queue) {
+    if (ptp && ptp->rx_queue) {
       rx = mt_dev_rx_burst(ptp->rx_queue, pkts_rx, ST_CNI_RX_BURST_SIZE);
       if (rx > 0) {
         cni->eth_rx_cnt[i] += rx;
@@ -103,12 +113,16 @@ static int cni_traffic(struct mtl_main_impl* impl) {
     if (cni->rsq[i]) {
       mt_rsq_burst(cni->rsq[i], ST_CNI_RX_BURST_SIZE);
     }
+    /* trigger rss rx */
+    if (cni->rss[i]) {
+      mt_rss_burst(cni->rss[i], ST_CNI_RX_BURST_SIZE);
+    }
   }
 
   return done ? MT_TASKLET_ALL_DONE : MT_TASKLET_HAS_PENDING;
 }
 
-static void* cni_trafic_thread(void* arg) {
+static void* cni_traffic_thread(void* arg) {
   struct mtl_main_impl* impl = arg;
   struct mt_cni_impl* cni = mt_get_cni(impl);
 
@@ -122,25 +136,25 @@ static void* cni_trafic_thread(void* arg) {
   return NULL;
 }
 
-static int cni_trafic_thread_start(struct mtl_main_impl* impl, struct mt_cni_impl* cni) {
+static int cni_traffic_thread_start(struct mtl_main_impl* impl, struct mt_cni_impl* cni) {
   int ret;
 
   if (cni->tid) {
-    err("%s, cni_trafic thread already start\n", __func__);
+    err("%s, cni_traffic thread already start\n", __func__);
     return 0;
   }
 
   rte_atomic32_set(&cni->stop_thread, 0);
-  ret = pthread_create(&cni->tid, NULL, cni_trafic_thread, impl);
+  ret = pthread_create(&cni->tid, NULL, cni_traffic_thread, impl);
   if (ret < 0) {
-    err("%s, cni_trafic thread create fail %d\n", __func__, ret);
+    err("%s, cni_traffic thread create fail %d\n", __func__, ret);
     return ret;
   }
 
   return 0;
 }
 
-static int cni_trafic_thread_stop(struct mt_cni_impl* cni) {
+static int cni_traffic_thread_stop(struct mt_cni_impl* cni) {
   rte_atomic32_set(&cni->stop_thread, 1);
   if (cni->tid) {
     pthread_join(cni->tid, NULL);
@@ -155,7 +169,7 @@ static int cni_tasklet_start(void* priv) {
   struct mt_cni_impl* cni = mt_get_cni(impl);
 
   /* tasklet will take over the cni thread */
-  if (cni->lcore_tasklet) cni_trafic_thread_stop(cni);
+  if (cni->lcore_tasklet) cni_traffic_thread_stop(cni);
 
   return 0;
 }
@@ -164,12 +178,12 @@ static int cni_tasklet_stop(void* priv) {
   struct mtl_main_impl* impl = priv;
   struct mt_cni_impl* cni = mt_get_cni(impl);
 
-  if (cni->lcore_tasklet) cni_trafic_thread_start(impl, cni);
+  if (cni->lcore_tasklet) cni_traffic_thread_start(impl, cni);
 
   return 0;
 }
 
-static int cni_tasklet_handlder(void* priv) {
+static int cni_tasklet_handler(void* priv) {
   struct mtl_main_impl* impl = priv;
 
   return cni_traffic(impl);
@@ -201,6 +215,14 @@ static int cni_queues_uinit(struct mtl_main_impl* impl) {
       mt_rsq_put(cni->rsq[i]);
       cni->rsq[i] = NULL;
     }
+    if (cni->rss[i]) {
+      mt_rss_put(cni->rss[i]);
+      cni->rss[i] = NULL;
+    }
+    if (cni->srss[i]) {
+      mt_srss_put(cni->srss[i]);
+      cni->srss[i] = NULL;
+    }
   }
 
   return 0;
@@ -227,23 +249,23 @@ static int cni_queues_init(struct mtl_main_impl* impl, struct mt_cni_impl* cni) 
     flow.priv = &cni->cni_priv[i];
     flow.cb = cni_rsq_mbuf_cb;
 
-    /* sys queue, no flow */
-    if (mt_shared_queue(impl, i)) {
+    if (mt_has_srss(impl, i)) {
+      cni->srss[i] = mt_srss_get(impl, i, &flow);
+      info("%s(%d), using shared rss for all queues\n", __func__, i);
+    } else if (mt_has_rss(impl, i)) {
+      cni->rss[i] = mt_rss_get(impl, i, &flow);
+      info("%s(%d), rss q %d\n", __func__, i, mt_rss_queue_id(cni->rss[i]));
+    } else if (mt_shared_queue(impl, i)) {
       cni->rsq[i] = mt_rsq_get(impl, i, &flow);
-      if (!cni->rsq[i]) {
-        err("%s(%d), rsq get fail\n", __func__, i);
-        cni_queues_uinit(impl);
-        return -EIO;
-      }
       info("%s(%d), rsq q %d\n", __func__, i, mt_rsq_queue_id(cni->rsq[i]));
-    } else {
+    } else { /* sys queue, no flow */
       cni->rx_q[i] = mt_dev_get_rx_queue(impl, i, NULL);
-      if (!cni->rx_q[i]) {
-        err("%s(%d), rx q get fail\n", __func__, i);
-        cni_queues_uinit(impl);
-        return -EIO;
-      }
       info("%s(%d), rx q %d\n", __func__, i, mt_dev_rx_queue_id(cni->rx_q[i]));
+    }
+    if (!cni->srss[i] && !cni->rss[i] && !cni->rsq[i] && !cni->rx_q[i]) {
+      err("%s(%d), rx queue get fail\n", __func__, i);
+      cni_queues_uinit(impl);
+      return -EIO;
     }
   }
 
@@ -295,6 +317,8 @@ int mt_cni_init(struct mtl_main_impl* impl) {
   ret = mt_tap_init(impl);
   if (ret < 0) return ret;
 
+  if (mt_has_srss(impl, MTL_PORT_P)) return 0;
+
   if (cni->lcore_tasklet) {
     struct mt_sch_tasklet_ops ops;
 
@@ -303,7 +327,7 @@ int mt_cni_init(struct mtl_main_impl* impl) {
     ops.name = "cni";
     ops.start = cni_tasklet_start;
     ops.stop = cni_tasklet_stop;
-    ops.handler = cni_tasklet_handlder;
+    ops.handler = cni_tasklet_handler;
 
     cni->tasklet = mt_sch_register_tasklet(impl->main_sch, &ops);
     if (!cni->tasklet) {
@@ -349,7 +373,7 @@ int mt_cni_start(struct mtl_main_impl* impl) {
 
   if (!cni->used) return 0;
 
-  ret = cni_trafic_thread_start(impl, cni);
+  ret = cni_traffic_thread_start(impl, cni);
   if (ret < 0) return ret;
 
   return 0;
@@ -360,7 +384,7 @@ int mt_cni_stop(struct mtl_main_impl* impl) {
 
   if (!cni->used) return 0;
 
-  cni_trafic_thread_stop(cni);
+  cni_traffic_thread_stop(cni);
 
   return 0;
 }

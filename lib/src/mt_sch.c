@@ -96,7 +96,7 @@ static int sch_tasklet_sleep(struct mtl_main_impl* impl, struct mt_sch_impl* sch
 
 static int sch_tasklet_func(void* args) {
   struct mt_sch_impl* sch = args;
-  struct mtl_main_impl* impl = sch->parnet;
+  struct mtl_main_impl* impl = sch->parent;
   int idx = sch->idx;
   int num_tasklet, i;
   struct mt_sch_tasklet_ops* ops;
@@ -130,6 +130,12 @@ static int sch_tasklet_func(void* args) {
     for (i = 0; i < num_tasklet; i++) {
       tasklet = sch->tasklet[i];
       if (!tasklet) continue;
+      if (tasklet->request_exit) {
+        tasklet->ack_exit = true;
+        sch->tasklet[i] = NULL;
+        dbg("%s(%d), tasklet %s(%d) exit\n", __func__, idx, tasklet->name, i);
+        continue;
+      }
       ops = &tasklet->ops;
       if (time_measure) tsc_s = mt_get_tsc(impl);
       pending += ops->handler(ops->priv);
@@ -181,7 +187,7 @@ static int sch_start(struct mt_sch_impl* sch) {
   rte_atomic32_set(&sch->stopped, 0);
 
   if (!sch->run_in_thread) {
-    ret = mt_dev_get_lcore(sch->parnet, &sch->lcore);
+    ret = mt_dev_get_lcore(sch->parent, &sch->lcore);
     if (ret < 0) {
       err("%s(%d), get lcore fail %d\n", __func__, idx, ret);
       sch_unlock(sch);
@@ -223,7 +229,7 @@ static int sch_stop(struct mt_sch_impl* sch) {
   }
   if (!sch->run_in_thread) {
     rte_eal_wait_lcore(sch->lcore);
-    mt_dev_put_lcore(sch->parnet, sch->lcore);
+    mt_dev_put_lcore(sch->parent, sch->lcore);
   } else {
     pthread_join(sch->tid, NULL);
   }
@@ -270,13 +276,13 @@ static int sch_free(struct mt_sch_impl* sch) {
   }
 
   sch_lock(sch);
-  for (int i = 0; i < MT_MAX_TASKLET_PER_SCH; i++) {
+  for (int i = 0; i < sch->nb_tasklets; i++) {
     if (sch->tasklet[i]) {
       warn("%s(%d), tasklet %d still active\n", __func__, idx, i);
       mt_sch_unregister_tasklet(sch->tasklet[i]);
     }
   }
-  rte_atomic32_dec(&mt_sch_get_mgr(sch->parnet)->sch_cnt);
+  rte_atomic32_dec(&mt_sch_get_mgr(sch->parent)->sch_cnt);
   rte_atomic32_dec(&sch->active);
   sch_unlock(sch);
   return 0;
@@ -336,7 +342,7 @@ static void sch_stat(struct mt_sch_impl* sch) {
   int idx = sch->idx;
   uint32_t avg_us;
 
-  if (mt_has_tasklet_time_measure(sch->parnet)) {
+  if (mt_has_tasklet_time_measure(sch->parent)) {
     for (int i = 0; i < num_tasklet; i++) {
       tasklet = sch->tasklet[i];
       if (!tasklet) continue;
@@ -379,20 +385,35 @@ int mt_sch_unregister_tasklet(struct mt_sch_tasklet_impl* tasklet) {
     return -EIO;
   }
 
-  /* todo: support runtime unregister */
   if (mt_sch_started(sch)) {
-    err("%s(%d), pls stop sch firstly\n", __func__, sch_idx);
-    sch_unlock(sch);
-    return -EIO;
+    int retry = 0;
+    /* wait sch ack this exit */
+    dbg("%s(%d), tasklet %s(%d) runtime unregistered\n", __func__, sch_idx, tasklet->name,
+        idx);
+    tasklet->ack_exit = false;
+    tasklet->request_exit = true;
+    do {
+      mt_sleep_ms(1);
+      retry++;
+      if (retry > 1000) {
+        err("%s(%d), tasklet %s(%d) runtime unregistered timeout\n", __func__, sch_idx,
+            tasklet->name, idx);
+        sch_unlock(sch);
+        return -EIO;
+      }
+    } while (!tasklet->ack_exit);
+    info("%s(%d), tasklet %s(%d) unregistered, retry %d\n", __func__, sch_idx,
+         tasklet->name, idx, retry);
+  } else {
+    /* safe to directly remove */
+    sch->tasklet[idx] = NULL;
+    info("%s(%d), tasklet %s(%d) unregistered\n", __func__, sch_idx, tasklet->name, idx);
   }
 
-  sch->tasklet[idx] = NULL;
-  info("%s(%d), tasklet %s unregistered at slot %d\n", __func__, sch_idx, tasklet->name,
-       idx);
   mt_rte_free(tasklet);
 
   int max_idx = 0;
-  for (int i = 0; i < MT_MAX_TASKLET_PER_SCH; i++) {
+  for (int i = 0; i < sch->nb_tasklets; i++) {
     if (sch->tasklet[i]) max_idx = i + 1;
   }
   sch->max_tasklet_idx = max_idx;
@@ -404,13 +425,13 @@ int mt_sch_unregister_tasklet(struct mt_sch_tasklet_impl* tasklet) {
 struct mt_sch_tasklet_impl* mt_sch_register_tasklet(
     struct mt_sch_impl* sch, struct mt_sch_tasklet_ops* tasklet_ops) {
   int idx = sch->idx;
-  struct mtl_main_impl* impl = sch->parnet;
+  struct mtl_main_impl* impl = sch->parent;
   struct mt_sch_tasklet_impl* tasklet;
 
   sch_lock(sch);
 
   /* find one empty slot in the mgr */
-  for (int i = 0; i < MT_MAX_TASKLET_PER_SCH; i++) {
+  for (int i = 0; i < sch->nb_tasklets; i++) {
     if (sch->tasklet[i]) continue;
 
     /* find one empty tasklet slot */
@@ -441,7 +462,7 @@ struct mt_sch_tasklet_impl* mt_sch_register_tasklet(
     return tasklet;
   }
 
-  err("%s(%d), no space on this sch\n", __func__, idx);
+  err("%s(%d), no space on this sch, max %d\n", __func__, idx, sch->nb_tasklets);
   sch_unlock(sch);
   return NULL;
 }
@@ -449,18 +470,21 @@ struct mt_sch_tasklet_impl* mt_sch_register_tasklet(
 int mt_sch_mrg_init(struct mtl_main_impl* impl, int data_quota_mbs_limit) {
   struct mt_sch_impl* sch;
   struct mt_sch_mgr* mgr = mt_sch_get_mgr(impl);
+  int socket = mt_socket_id(impl, MTL_PORT_P);
+  int nb_tasklets = impl->tasklets_nb_per_sch;
 
   mt_pthread_mutex_init(&mgr->mgr_mutex, NULL);
 
   for (int sch_idx = 0; sch_idx < MT_MAX_SCH_NUM; sch_idx++) {
     sch = mt_sch_instance(impl, sch_idx);
     mt_pthread_mutex_init(&sch->mutex, NULL);
-    sch->parnet = impl;
+    sch->parent = impl;
     sch->idx = sch_idx;
     rte_atomic32_set(&sch->started, 0);
     rte_atomic32_set(&sch->ref_cnt, 0);
     rte_atomic32_set(&sch->active, 0);
     sch->max_tasklet_idx = 0;
+    sch->nb_tasklets = nb_tasklets;
     sch->data_quota_mbs_total = 0;
     sch->data_quota_mbs_limit = data_quota_mbs_limit;
     sch->run_in_thread = mt_tasklet_has_thread(impl);
@@ -481,9 +505,18 @@ int mt_sch_mrg_init(struct mtl_main_impl* impl, int data_quota_mbs_limit) {
     /* init mgr lock for video */
     mt_pthread_mutex_init(&sch->tx_video_mgr_mutex, NULL);
     mt_pthread_mutex_init(&sch->rx_video_mgr_mutex, NULL);
+
+    sch->tasklet =
+        mt_rte_zmalloc_socket(sizeof(*sch->tasklet) * sch->nb_tasklets, socket);
+    if (!sch->tasklet) {
+      err("%s(%d), tasklet malloc fail\n", __func__, sch_idx);
+      mt_sch_mrg_uinit(impl);
+      return -ENOMEM;
+    }
   }
 
-  info("%s, succ with data quota %d M\n", __func__, data_quota_mbs_limit);
+  info("%s, succ with data quota %d M, nb_tasklets %d\n", __func__, data_quota_mbs_limit,
+       nb_tasklets);
   return 0;
 }
 
@@ -493,6 +526,11 @@ int mt_sch_mrg_uinit(struct mtl_main_impl* impl) {
 
   for (int sch_idx = 0; sch_idx < MT_MAX_SCH_NUM; sch_idx++) {
     sch = mt_sch_instance(impl, sch_idx);
+
+    if (sch->tasklet) {
+      mt_rte_free(sch->tasklet);
+      sch->tasklet = NULL;
+    }
 
     mt_pthread_mutex_destroy(&sch->tx_video_mgr_mutex);
     mt_pthread_mutex_destroy(&sch->rx_video_mgr_mutex);
@@ -533,7 +571,7 @@ int mt_sch_add_quota(struct mt_sch_impl* sch, int quota_mbs) {
 
 int mt_sch_put(struct mt_sch_impl* sch, int quota_mbs) {
   int sidx = sch->idx, ret;
-  struct mtl_main_impl* impl = sch->parnet;
+  struct mtl_main_impl* impl = sch->parent;
 
   sch_free_quota(sch, quota_mbs);
 

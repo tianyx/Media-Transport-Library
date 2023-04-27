@@ -7,12 +7,16 @@
 
 #include "mt_main.h"
 
+/* default desc nb for tx and rx */
 #define MT_DEV_RX_DESC (4096 / 2)
 #define MT_DEV_TX_DESC (4096 / 8)
 
 #define MT_DEV_STAT_INTERVAL_S (10) /* 10s */
 #define MT_DEV_STAT_INTERVAL_US(s) (s * US_PER_S)
 #define MT_DEV_STAT_M_UNIT (1000 * 1000)
+
+#define MT_DEV_TIMEOUT_INFINITE (INT_MAX)
+#define MT_DEV_TIMEOUT_ZERO (0)
 
 #define MT_EAL_MAX_ARGS (32)
 
@@ -40,6 +44,7 @@ int mt_dev_set_tx_bps(struct mtl_main_impl* impl, enum mtl_port port, uint16_t q
                       uint64_t bytes_per_sec);
 int mt_dev_flush_tx_queue(struct mtl_main_impl* impl, struct mt_tx_queue* queue,
                           struct rte_mbuf* pad);
+int mt_dev_tx_done_cleanup(struct mtl_main_impl* impl, struct mt_tx_queue* queue);
 static inline uint16_t mt_dev_tx_burst(struct mt_tx_queue* queue,
                                        struct rte_mbuf** tx_pkts, uint16_t nb_pkts) {
   return rte_eth_tx_burst(queue->port_id, queue->queue_id, tx_pkts, nb_pkts);
@@ -75,6 +80,9 @@ bool mt_dev_lcore_valid(struct mtl_main_impl* impl, unsigned int lcore);
 int mt_dev_tsc_done_action(struct mtl_main_impl* impl);
 
 uint32_t mt_dev_softrss(uint32_t* input_tuple, uint32_t input_len);
+
+uint16_t mt_dev_rss_hash_queue(struct mtl_main_impl* impl, enum mtl_port port,
+                               uint32_t hash);
 
 struct mt_rx_flow_rsp* mt_dev_create_rx_flow(struct mtl_main_impl* impl,
                                              enum mtl_port port, uint16_t q,

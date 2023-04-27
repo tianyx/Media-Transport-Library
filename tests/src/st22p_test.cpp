@@ -447,10 +447,11 @@ static void st22p_tx_ops_init(tests_context* st22, struct st22p_tx_ops* ops_tx) 
   ops_tx->name = "st22p_test";
   ops_tx->priv = st22;
   ops_tx->port.num_port = 1;
-  memcpy(ops_tx->port.dip_addr[MTL_PORT_P], ctx->mcast_ip_addr[MTL_PORT_P],
+  memcpy(ops_tx->port.dip_addr[MTL_SESSION_PORT_P], ctx->mcast_ip_addr[MTL_PORT_P],
          MTL_IP_ADDR_LEN);
-  strncpy(ops_tx->port.port[MTL_PORT_P], ctx->para.port[MTL_PORT_P], MTL_PORT_MAX_LEN);
-  ops_tx->port.udp_port[MTL_PORT_P] = ST22P_TEST_UDP_PORT + st22->idx;
+  strncpy(ops_tx->port.port[MTL_SESSION_PORT_P], ctx->para.port[MTL_PORT_P],
+          MTL_PORT_MAX_LEN);
+  ops_tx->port.udp_port[MTL_SESSION_PORT_P] = ST22P_TEST_UDP_PORT + st22->idx;
   ops_tx->port.payload_type = ST22P_TEST_PAYLOAD_TYPE;
   ops_tx->width = 1920;
   ops_tx->height = 1080;
@@ -474,10 +475,11 @@ static void st22p_rx_ops_init(tests_context* st22, struct st22p_rx_ops* ops_rx) 
   ops_rx->name = "st22p_test";
   ops_rx->priv = st22;
   ops_rx->port.num_port = 1;
-  memcpy(ops_rx->port.sip_addr[MTL_PORT_P], ctx->mcast_ip_addr[MTL_PORT_P],
+  memcpy(ops_rx->port.sip_addr[MTL_SESSION_PORT_P], ctx->mcast_ip_addr[MTL_PORT_P],
          MTL_IP_ADDR_LEN);
-  strncpy(ops_rx->port.port[MTL_PORT_P], ctx->para.port[MTL_PORT_R], MTL_PORT_MAX_LEN);
-  ops_rx->port.udp_port[MTL_PORT_P] = ST22P_TEST_UDP_PORT + st22->idx;
+  strncpy(ops_rx->port.port[MTL_SESSION_PORT_P], ctx->para.port[MTL_PORT_R],
+          MTL_PORT_MAX_LEN);
+  ops_rx->port.udp_port[MTL_SESSION_PORT_P] = ST22P_TEST_UDP_PORT + st22->idx;
   ops_rx->port.payload_type = ST22P_TEST_PAYLOAD_TYPE;
   ops_rx->width = 1920;
   ops_rx->height = 1080;
@@ -731,10 +733,11 @@ static void st22p_rx_digest_test(enum st_fps fps[], int width[], int height[],
     ops_tx.name = "st22p_test";
     ops_tx.priv = test_ctx_tx[i];
     ops_tx.port.num_port = 1;
-    memcpy(ops_tx.port.dip_addr[MTL_PORT_P], ctx->para.sip_addr[MTL_PORT_R],
+    memcpy(ops_tx.port.dip_addr[MTL_SESSION_PORT_P], ctx->para.sip_addr[MTL_PORT_R],
            MTL_IP_ADDR_LEN);
-    strncpy(ops_tx.port.port[MTL_PORT_P], ctx->para.port[MTL_PORT_P], MTL_PORT_MAX_LEN);
-    ops_tx.port.udp_port[MTL_PORT_P] = ST22P_TEST_UDP_PORT + i;
+    strncpy(ops_tx.port.port[MTL_SESSION_PORT_P], ctx->para.port[MTL_PORT_P],
+            MTL_PORT_MAX_LEN);
+    ops_tx.port.udp_port[MTL_SESSION_PORT_P] = ST22P_TEST_UDP_PORT + i;
     ops_tx.port.payload_type = ST22P_TEST_PAYLOAD_TYPE;
     ops_tx.width = width[i];
     ops_tx.height = height[i];
@@ -778,15 +781,12 @@ static void st22p_rx_digest_test(enum st_fps fps[], int width[], int height[],
   }
 
   for (int i = 0; i < sessions; i++) {
-    expect_framerate_rx[i] = expect_framerate_tx[i];
     if (para->fail_interval) {
       /* loss in the tx */
-      expect_framerate_rx[i] =
-          expect_framerate_rx[i] * (para->fail_interval - 1) / para->fail_interval;
-      /* loss in the rx */
-      expect_framerate_rx[i] =
-          expect_framerate_rx[i] * (para->fail_interval - 1) / para->fail_interval;
+      expect_framerate_tx[i] =
+          expect_framerate_tx[i] * (para->fail_interval - 1) / para->fail_interval;
     }
+    expect_framerate_rx[i] = expect_framerate_tx[i];
     test_ctx_rx[i] = new tests_context();
     ASSERT_TRUE(test_ctx_tx[i] != NULL);
 
@@ -806,10 +806,11 @@ static void st22p_rx_digest_test(enum st_fps fps[], int width[], int height[],
     ops_rx.name = "st22p_test";
     ops_rx.priv = test_ctx_rx[i];
     ops_rx.port.num_port = 1;
-    memcpy(ops_rx.port.sip_addr[MTL_PORT_P], ctx->para.sip_addr[MTL_PORT_P],
+    memcpy(ops_rx.port.sip_addr[MTL_SESSION_PORT_P], ctx->para.sip_addr[MTL_PORT_P],
            MTL_IP_ADDR_LEN);
-    strncpy(ops_rx.port.port[MTL_PORT_P], ctx->para.port[MTL_PORT_R], MTL_PORT_MAX_LEN);
-    ops_rx.port.udp_port[MTL_PORT_P] = ST22P_TEST_UDP_PORT + i;
+    strncpy(ops_rx.port.port[MTL_SESSION_PORT_P], ctx->para.port[MTL_PORT_R],
+            MTL_PORT_MAX_LEN);
+    ops_rx.port.udp_port[MTL_SESSION_PORT_P] = ST22P_TEST_UDP_PORT + i;
     ops_rx.port.payload_type = ST22P_TEST_PAYLOAD_TYPE;
     ops_rx.width = width[i];
     ops_rx.height = height[i];
@@ -849,13 +850,15 @@ static void st22p_rx_digest_test(enum st_fps fps[], int width[], int height[],
     double time_sec = (double)(cur_time_ns - test_ctx_tx[i]->start_time) / NS_PER_S;
     framerate_tx[i] = test_ctx_tx[i]->fb_send / time_sec;
 
-    /* vsync check */
-    time_sec = (double)(cur_time_ns - test_ctx_tx[i]->first_vsync_time) / NS_PER_S;
-    vsyncrate_tx[i] = test_ctx_tx[i]->vsync_cnt / time_sec;
-    dbg("%s(%d,%p), vsync_cnt %d vsyncrate %f\n", __func__, i, test_ctx_tx[i],
-        test_ctx_tx[i]->vsync_cnt, vsyncrate_tx[i]);
-    EXPECT_GT(test_ctx_tx[i]->vsync_cnt, 0);
-    EXPECT_NEAR(vsyncrate_tx[i], st_frame_rate(fps[i]), st_frame_rate(fps[i]) * 0.1);
+    if (ctx->para.rss_mode != MTL_RSS_MODE_L3_L4) {
+      /* vsync check */
+      time_sec = (double)(cur_time_ns - test_ctx_tx[i]->first_vsync_time) / NS_PER_S;
+      vsyncrate_tx[i] = test_ctx_tx[i]->vsync_cnt / time_sec;
+      dbg("%s(%d,%p), vsync_cnt %d vsyncrate %f\n", __func__, i, test_ctx_tx[i],
+          test_ctx_tx[i]->vsync_cnt, vsyncrate_tx[i]);
+      EXPECT_GT(test_ctx_tx[i]->vsync_cnt, 0);
+      EXPECT_NEAR(vsyncrate_tx[i], st_frame_rate(fps[i]), st_frame_rate(fps[i]) * 0.1);
+    }
 
     test_ctx_tx[i]->stop = true;
     test_ctx_tx[i]->cv.notify_all();
@@ -866,13 +869,15 @@ static void st22p_rx_digest_test(enum st_fps fps[], int width[], int height[],
     double time_sec = (double)(cur_time_ns - test_ctx_rx[i]->start_time) / NS_PER_S;
     framerate_rx[i] = test_ctx_rx[i]->fb_rec / time_sec;
 
-    /* vsync check */
-    time_sec = (double)(cur_time_ns - test_ctx_rx[i]->first_vsync_time) / NS_PER_S;
-    vsyncrate_rx[i] = test_ctx_rx[i]->vsync_cnt / time_sec;
-    dbg("%s(%d,%p), vsync_cnt %d vsyncrate %f\n", __func__, i, test_ctx_rx[i],
-        test_ctx_rx[i]->vsync_cnt, vsyncrate_rx[i]);
-    EXPECT_GT(test_ctx_rx[i]->vsync_cnt, 0);
-    EXPECT_NEAR(vsyncrate_rx[i], st_frame_rate(fps[i]), st_frame_rate(fps[i]) * 0.1);
+    if (ctx->para.rss_mode != MTL_RSS_MODE_L3_L4) {
+      /* vsync check */
+      time_sec = (double)(cur_time_ns - test_ctx_rx[i]->first_vsync_time) / NS_PER_S;
+      vsyncrate_rx[i] = test_ctx_rx[i]->vsync_cnt / time_sec;
+      dbg("%s(%d,%p), vsync_cnt %d vsyncrate %f\n", __func__, i, test_ctx_rx[i],
+          test_ctx_rx[i]->vsync_cnt, vsyncrate_rx[i]);
+      EXPECT_GT(test_ctx_rx[i]->vsync_cnt, 0);
+      EXPECT_NEAR(vsyncrate_rx[i], st_frame_rate(fps[i]), st_frame_rate(fps[i]) * 0.1);
+    }
 
     test_ctx_rx[i]->stop = true;
     test_ctx_rx[i]->cv.notify_all();

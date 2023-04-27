@@ -64,7 +64,7 @@ int mt_build_port_map(struct mtl_main_impl* impl, char** ports, enum mtl_port* m
 
 /* logical session port to main(physical) port */
 static inline enum mtl_port mt_port_logic2phy(enum mtl_port* maps,
-                                              enum mt_session_port logic) {
+                                              enum mtl_session_port logic) {
   return maps[logic];
 }
 
@@ -157,18 +157,6 @@ static inline int mt_cvt_dma_ctx_get_tran(struct mt_cvt_dma_ctx* ctx, int type) 
 
 int mt_run_cmd(const char* cmd, char* out, size_t out_len);
 
-static inline void mt_mbuf_chain_sw_copy(struct rte_mbuf* pkt,
-                                         struct rte_mbuf* pkt_chain) {
-  /* copy payload to hdr */
-  rte_memcpy(rte_pktmbuf_mtod_offset(pkt, void*, pkt->data_len),
-             rte_pktmbuf_mtod(pkt_chain, void*), pkt_chain->pkt_len);
-}
-
-static inline void mt_mbuf_chain_sw(struct rte_mbuf* pkt, struct rte_mbuf* pkt_chain) {
-  mt_mbuf_chain_sw_copy(pkt, pkt_chain);
-  pkt->data_len += pkt_chain->pkt_len;
-}
-
 int mt_ip_addr_check(uint8_t* ip);
 
 int st_rx_source_info_check(struct st_rx_source_info* src, int num_ports);
@@ -176,5 +164,9 @@ int st_rx_source_info_check(struct st_rx_source_info* src, int num_ports);
 int st_frame_trans_uinit(struct st_frame_trans* frame);
 
 int st_vsync_calculate(struct mtl_main_impl* impl, struct st_vsync_info* vsync);
+
+uint16_t mt_random_port(uint16_t base_port);
+
+static inline const char* mt_msg_safe(const char* msg) { return msg ? msg : "null"; }
 
 #endif

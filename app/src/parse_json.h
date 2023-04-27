@@ -118,14 +118,15 @@ struct st_video_fmt_desc {
 
 typedef struct st_json_interface {
   char name[MTL_PORT_MAX_LEN];
+  enum mtl_net_proto net_proto;
   uint8_t ip_addr[MTL_IP_ADDR_LEN];
   uint8_t netmask[MTL_IP_ADDR_LEN];
   uint8_t gateway[MTL_IP_ADDR_LEN];
 } st_json_interface_t;
 
 typedef struct st_json_session_base {
-  uint8_t ip[MTL_PORT_MAX][MTL_IP_ADDR_LEN];
-  st_json_interface_t* inf[MTL_PORT_MAX];
+  uint8_t ip[MTL_SESSION_PORT_MAX][MTL_IP_ADDR_LEN];
+  st_json_interface_t* inf[MTL_SESSION_PORT_MAX];
   int num_inf;
   uint16_t udp_port;
   uint8_t payload_type;

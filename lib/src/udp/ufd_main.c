@@ -85,19 +85,19 @@ static int ufd_parse_interfaces(struct mufd_init_params* init, json_object* obj,
   const char* name = json_object_get_string(mt_json_object_get(obj, "port"));
   if (!name) {
     err("%s, no port in the json interface\n", __func__);
-    return -EINVAL;
+    MUDP_ERR_RET(EINVAL);
   }
   snprintf(p->port[port], MTL_PORT_MAX_LEN, "%s", name);
 
   const char* sip = json_object_get_string(mt_json_object_get(obj, "ip"));
   if (!sip) {
     err("%s, no ip in the json interface\n", __func__);
-    return -EINVAL;
+    MUDP_ERR_RET(EINVAL);
   }
   int ret = inet_pton(AF_INET, sip, p->sip_addr[port]);
   if (ret != 1) {
     err("%s, inet pton fail ip %s\n", __func__, sip);
-    return -EINVAL;
+    MUDP_ERR_RET(EINVAL);
   }
 
   json_object* obj_item = mt_json_object_get(obj, "netmask");
@@ -118,7 +118,7 @@ static int ufd_parse_json(struct mufd_init_params* init, const char* filename) {
   json_object* root = json_object_from_file(filename);
   if (root == NULL) {
     err("%s, open json file %s fail\n", __func__, filename);
-    return -EIO;
+    MUDP_ERR_RET(EIO);
   }
   info("%s, parse %s with json-c version: %s\n", __func__, filename, json_c_version());
   int ret = -EIO;
@@ -170,11 +170,43 @@ static int ufd_parse_json(struct mufd_init_params* init, const char* filename) {
     info("%s, nb_udp_sockets %d\n", __func__, nb_udp_sockets);
   }
 
+  obj = mt_json_object_get(root, "nb_tx_desc");
+  if (obj) {
+    int nb_tx_desc = json_object_get_int(obj);
+    if ((nb_tx_desc < 0) || (nb_tx_desc > 4096)) {
+      err("%s, invalid nb_tx_desc %d\n", __func__, nb_tx_desc);
+      ret = -EINVAL;
+      goto out;
+    }
+    p->nb_tx_desc = nb_tx_desc;
+    info("%s, nb_tx_desc %d\n", __func__, nb_tx_desc);
+  }
+
+  obj = mt_json_object_get(root, "nb_rx_desc");
+  if (obj) {
+    int nb_rx_desc = json_object_get_int(obj);
+    if ((nb_rx_desc < 0) || (nb_rx_desc > 4096)) {
+      err("%s, invalid nb_rx_desc %d\n", __func__, nb_rx_desc);
+      ret = -EINVAL;
+      goto out;
+    }
+    p->nb_tx_desc = nb_rx_desc;
+    info("%s, nb_rx_desc %d\n", __func__, nb_rx_desc);
+  }
+
   obj = mt_json_object_get(root, "nic_shared_queues");
   if (obj) {
     if (json_object_get_boolean(obj)) {
       info("%s, shared queues enabled\n", __func__);
       p->flags |= MTL_FLAG_SHARED_QUEUE;
+    }
+  }
+
+  obj = mt_json_object_get(root, "udp_lcore");
+  if (obj) {
+    if (json_object_get_boolean(obj)) {
+      info("%s, udp lcore enabled\n", __func__);
+      p->flags |= MTL_FLAG_UDP_LCORE;
     }
   }
 
@@ -200,8 +232,9 @@ static int ufd_parse_json(struct mufd_init_params* init, const char* filename) {
   obj = mt_json_object_get(root, "fd_base");
   if (obj) {
     int fd_base = json_object_get_int(obj);
-    if (fd_base < 0) {
-      err("%s, invalid fd_base %d\n", __func__, fd_base);
+    int limit = INT_MAX / 2;
+    if (fd_base < limit) {
+      err("%s, invalid fd_base %d, must bigger than %d\n", __func__, fd_base, limit);
       ret = -EINVAL;
       goto out;
     }
@@ -217,8 +250,64 @@ static int ufd_parse_json(struct mufd_init_params* init, const char* filename) {
       ret = -EINVAL;
       goto out;
     }
-    init->txq_bps = rl_bps_g * 1000 * 1000 * 1000;
+    init->txq_bps = (uint64_t)rl_bps_g * 1000 * 1000 * 1000;
     info("%s, nic_queue_rate_limit_g %d\n", __func__, rl_bps_g);
+  }
+
+  obj = mt_json_object_get(root, "rx_ring_count");
+  if (obj) {
+    int rx_ring_count = json_object_get_int(obj);
+    if (rx_ring_count < 0) {
+      err("%s, invalid rx_ring_count %d\n", __func__, rx_ring_count);
+      ret = -EINVAL;
+      goto out;
+    }
+    init->rx_ring_count = rx_ring_count;
+    info("%s, rx_ring_count %d\n", __func__, rx_ring_count);
+  }
+
+  obj = mt_json_object_get(root, "wake_thresh_count");
+  if (obj) {
+    int wake_thresh_count = json_object_get_int(obj);
+    if (wake_thresh_count < 0) {
+      err("%s, invalid wake_thresh_count %d\n", __func__, wake_thresh_count);
+      ret = -EINVAL;
+      goto out;
+    }
+    init->wake_thresh_count = wake_thresh_count;
+    info("%s, wake_thresh_count %d\n", __func__, wake_thresh_count);
+  }
+
+  obj = mt_json_object_get(root, "wake_timeout_us");
+  if (obj) {
+    int wake_timeout_us = json_object_get_int(obj);
+    if (wake_timeout_us < 0) {
+      err("%s, invalid wake_timeout_us %d\n", __func__, wake_timeout_us);
+      ret = -EINVAL;
+      goto out;
+    }
+    init->wake_timeout_us = wake_timeout_us;
+    info("%s, wake_timeout_us %d\n", __func__, wake_timeout_us);
+  }
+
+  obj = mt_json_object_get(root, "rx_poll_sleep_us");
+  if (obj) {
+    int rx_poll_sleep_us = json_object_get_int(obj);
+    if (rx_poll_sleep_us < 0) {
+      err("%s, invalid rx_poll_sleep_us %d\n", __func__, rx_poll_sleep_us);
+      ret = -EINVAL;
+      goto out;
+    }
+    init->rx_poll_sleep_us = rx_poll_sleep_us;
+    info("%s, rx_poll_sleep_us %d\n", __func__, rx_poll_sleep_us);
+  }
+
+  obj = mt_json_object_get(root, "bind_address_check");
+  if (obj) {
+    if (json_object_get_boolean(obj)) {
+      info("%s, bind address check enabled\n", __func__);
+      init->flags |= MUFD_FLAG_BIND_ADDRESS_CHECK;
+    }
   }
 
   ret = 0;
@@ -272,10 +361,12 @@ static struct ufd_mt_ctx* ufd_create_mt_ctx(void) {
       return NULL;
     }
 
-    /* overide config if it runtime config */
+    /* override config if it runtime config */
     if (rt_para) {
-      info("%s, applied overide config\n", __func__);
+      info("%s, applied override config\n", __func__);
       p->log_level = rt_para->log_level;
+      if (rt_para->shared_queue) p->flags |= MTL_FLAG_SHARED_QUEUE;
+      if (rt_para->lcore_mode) p->flags |= MTL_FLAG_UDP_LCORE;
     }
   }
 
@@ -284,8 +375,14 @@ static struct ufd_mt_ctx* ufd_create_mt_ctx(void) {
 
   /* assign a default if not set by user */
   if (!ctx->init_params.slots_nb_max) ctx->init_params.slots_nb_max = 1024;
-  if (!ctx->init_params.fd_base) ctx->init_params.fd_base = UFD_FD_BASE_DEFAULT;
+  /* ufd is assigned to top of INT, the bottom fd is used by OS */
+  if (!ctx->init_params.fd_base)
+    ctx->init_params.fd_base = INT_MAX - ctx->init_params.slots_nb_max * 2;
   if (!ctx->init_params.txq_bps) ctx->init_params.txq_bps = MUDP_DEFAULT_RL_BPS;
+
+  /* udp lcore and shared queue, set tasklets_nb_per_sch to allow max slots */
+  if ((p->flags & MTL_FLAG_SHARED_QUEUE) && (p->flags & MTL_FLAG_UDP_LCORE))
+    p->tasklets_nb_per_sch = ctx->init_params.slots_nb_max + 8;
 
   ctx->mt = mtl_init(p);
   if (!ctx->mt) {
@@ -309,15 +406,19 @@ static struct ufd_mt_ctx* ufd_create_mt_ctx(void) {
 static struct ufd_mt_ctx* ufd_get_mt_ctx(bool create) {
   struct ufd_mt_ctx* ctx = NULL;
 
-  /* get the mt ctx */
-  ufd_mtl_ctx_lock();
-  ctx = g_ufd_mt_ctx;
-  if (!ctx && create) { /* create a new ctx */
-    info("%s, start to create mt ctx\n", __func__);
-    ctx = ufd_create_mt_ctx();
-    g_ufd_mt_ctx = ctx;
+  if (create) { /* require lock as get/create the mt ctx */
+    ufd_mtl_ctx_lock();
+    ctx = g_ufd_mt_ctx;
+    if (!ctx) { /* create a new ctx */
+      info("%s, start to create mt ctx\n", __func__);
+      ctx = ufd_create_mt_ctx();
+      g_ufd_mt_ctx = ctx;
+    }
+    ufd_mtl_ctx_unlock();
+  } else {
+    /* no lock need for pure global get */
+    ctx = g_ufd_mt_ctx;
   }
-  ufd_mtl_ctx_unlock();
 
   return ctx;
 }
@@ -331,6 +432,11 @@ static void ufd_clear_mt_ctx(void) {
 
 static inline struct ufd_slot* ufd_fd2slot(int sockfd) {
   struct ufd_mt_ctx* ctx = ufd_get_mt_ctx(false);
+  if (sockfd < ctx->init_params.fd_base) {
+    err("%s, invalid sockfd %d, base is %d\n", __func__, sockfd,
+        ctx->init_params.fd_base);
+    return NULL;
+  }
   int idx = ufd_fd2idx(ctx, sockfd);
   struct ufd_slot* slot = ctx->slots[idx];
 
@@ -343,16 +449,16 @@ int mufd_socket_port(int domain, int type, int protocol, enum mtl_port port) {
   struct ufd_mt_ctx* ctx;
   struct ufd_slot* slot = NULL;
 
-  ret = mudp_verfiy_socket_args(domain, type, protocol);
+  ret = mudp_verify_socket_args(domain, type, protocol);
   if (ret < 0) return ret;
   ctx = ufd_get_mt_ctx(true);
   if (!ctx) {
     err("%s, fail to get ufd mt ctx\n", __func__);
-    return -EIO;
+    MUDP_ERR_RET(EIO);
   }
   if ((port < 0) || (port >= ctx->init_params.mt_params.num_ports)) {
     err("%s, invalid port %d\n", __func__, port);
-    return -EINVAL;
+    MUDP_ERR_RET(EINVAL);
   }
 
   /* find one empty slot */
@@ -364,7 +470,7 @@ int mufd_socket_port(int domain, int type, int protocol, enum mtl_port port) {
     if (!slot) {
       err("%s, slot malloc fail\n", __func__);
       mt_pthread_mutex_unlock(&ctx->slots_lock);
-      return -ENOMEM;
+      MUDP_ERR_RET(ENOMEM);
     }
     slot->idx = i;
     ctx->slots[i] = slot;
@@ -374,7 +480,7 @@ int mufd_socket_port(int domain, int type, int protocol, enum mtl_port port) {
 
   if (!slot) {
     err("%s, all slot used, max allowed %d\n", __func__, ufd_max_slot(ctx));
-    return -ENOMEM;
+    MUDP_ERR_RET(ENOMEM);
   }
 
   int idx = slot->idx;
@@ -386,17 +492,34 @@ int mufd_socket_port(int domain, int type, int protocol, enum mtl_port port) {
   if (!slot->handle) {
     err("%s, socket create fail\n", __func__);
     ufd_free_slot(ctx, slot);
-    return -ENOMEM;
+    MUDP_ERR_RET(ENOMEM);
   }
 
   mudp_set_tx_rate(slot->handle, ctx->init_params.txq_bps);
+  if (ctx->init_params.rx_ring_count)
+    mudp_set_rx_ring_count(slot->handle, ctx->init_params.rx_ring_count);
+  if (ctx->init_params.wake_thresh_count)
+    mudp_set_wake_thresh_count(slot->handle, ctx->init_params.wake_thresh_count);
+  if (ctx->init_params.wake_timeout_us)
+    mudp_set_wake_timeout(slot->handle, ctx->init_params.wake_timeout_us);
+  /* allow to set zero to disable sleep */
+  mudp_set_rx_poll_sleep(slot->handle, ctx->init_params.rx_poll_sleep_us);
+  if (ctx->init_params.flags & MUFD_FLAG_BIND_ADDRESS_CHECK)
+    mudp_bind_address_check(slot->handle, true);
 
   info("%s(%d), succ, fd %d\n", __func__, idx, fd);
   return fd;
 }
 
 int mufd_socket(int domain, int type, int protocol) {
-  return mufd_socket_port(domain, type, protocol, MTL_PORT_P);
+  enum mtl_port port = MTL_PORT_P;
+  /* port select from env */
+  const char* port_u = getenv(MUFD_PORT_ENV_NAME);
+  if (port_u) {
+    port = atoi(port_u);
+    dbg("%s, port_u %s port %d\n", __func__, port_u, port);
+  }
+  return mufd_socket_port(domain, type, protocol, port);
 }
 
 int mufd_close(int sockfd) {
@@ -405,8 +528,8 @@ int mufd_close(int sockfd) {
   struct ufd_slot* slot = ufd_fd2slot(sockfd);
 
   if (!slot) {
-    info("%s(%d), null slot for fd %d\n", __func__, idx, sockfd);
-    return -EIO;
+    err("%s(%d), null slot for fd %d\n", __func__, idx, sockfd);
+    MUDP_ERR_RET(EIO);
   }
 
   ufd_free_slot(ctx, slot);
@@ -424,7 +547,13 @@ ssize_t mufd_sendto(int sockfd, const void* buf, size_t len, int flags,
   return mudp_sendto(slot->handle, buf, len, flags, dest_addr, addrlen);
 }
 
-int mufd_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
+ssize_t mufd_sendmsg(int sockfd, const struct msghdr* msg, int flags) {
+  struct ufd_slot* slot = ufd_fd2slot(sockfd);
+  return mudp_sendmsg(slot->handle, msg, flags);
+}
+
+int mufd_poll_query(struct pollfd* fds, nfds_t nfds, int timeout,
+                    int (*query)(void* priv), void* priv) {
   struct mudp_pollfd mfds[nfds];
   struct ufd_slot* slot;
 
@@ -435,17 +564,26 @@ int mufd_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
     mfds[i].events = fds[i].events;
   }
 
-  int ret = mudp_poll(mfds, nfds, timeout);
+  int ret = mudp_poll_query(mfds, nfds, timeout, query, priv);
   for (nfds_t i = 0; i < nfds; i++) {
     fds[i].revents = mfds[i].revents;
   }
   return ret;
 }
 
+int mufd_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
+  return mufd_poll_query(fds, nfds, timeout, NULL, NULL);
+}
+
 ssize_t mufd_recvfrom(int sockfd, void* buf, size_t len, int flags,
                       struct sockaddr* src_addr, socklen_t* addrlen) {
   struct ufd_slot* slot = ufd_fd2slot(sockfd);
   return mudp_recvfrom(slot->handle, buf, len, flags, src_addr, addrlen);
+}
+
+ssize_t mufd_recvmsg(int sockfd, struct msghdr* msg, int flags) {
+  struct ufd_slot* slot = ufd_fd2slot(sockfd);
+  return mudp_recvmsg(slot->handle, msg, flags);
 }
 
 int mufd_getsockopt(int sockfd, int level, int optname, void* optval, socklen_t* optlen) {
@@ -459,22 +597,27 @@ int mufd_setsockopt(int sockfd, int level, int optname, const void* optval,
   return mudp_setsockopt(slot->handle, level, optname, optval, optlen);
 }
 
-int mufd_fcntl(int sockfd, int cmd, ...) {
+int mufd_fcntl(int sockfd, int cmd, va_list args) {
   struct ufd_slot* slot = ufd_fd2slot(sockfd);
   int idx = slot->idx;
 
 #ifdef WINDOWSENV
   err("%s(%d), invalid cmd %d, not support on windows\n", __func__, idx, cmd);
-  return -1;
+  MUDP_ERR_RET(EINVAL);
 #else
   if (cmd != F_SETFD) {
     err("%s(%d), invalid cmd %d\n", __func__, idx, cmd);
-    return -1;
+    MUDP_ERR_RET(EINVAL);
   }
 
   dbg("%s(%d), cmd %d\n", __func__, idx, cmd);
   return 0;
 #endif
+}
+
+int mufd_ioctl(int sockfd, unsigned long cmd, va_list args) {
+  struct ufd_slot* slot = ufd_fd2slot(sockfd);
+  return mudp_ioctl(slot->handle, cmd, args);
 }
 
 int mufd_cleanup(void) {
@@ -500,13 +643,13 @@ int mufd_cleanup(void) {
 }
 
 /* lib constructors to init the resources */
-RTE_INIT(mufd_init) {
+RTE_INIT_PRIO(mufd_init_global, BUS) {
   ufd_init_global();
   dbg("%s, succ\n", __func__);
 }
 
 /* lib destructor to cleanup the resources */
-RTE_FINI(mufd_finish) {
+RTE_FINI_PRIO(mufd_finish_global, BUS) {
   mufd_cleanup();
   ufd_uinit_global();
   dbg("%s, succ\n", __func__);
@@ -536,13 +679,13 @@ uint64_t mufd_get_tx_rate(int sockfd) {
 int mufd_commit_override_params(struct mufd_override_params* p) {
   if (g_rt_para) {
     err("%s, already committed\n", __func__);
-    return -EIO;
+    MUDP_ERR_RET(EIO);
   }
 
   struct mufd_override_params* out = mt_zmalloc(sizeof(*out));
   if (!out) {
     err("%s, malloc out fail\n", __func__);
-    return -ENOMEM;
+    MUDP_ERR_RET(ENOMEM);
   }
   rte_memcpy(out, p, sizeof(*p));
   g_rt_para = out;
@@ -553,13 +696,13 @@ int mufd_commit_override_params(struct mufd_override_params* p) {
 int mufd_commit_init_params(struct mufd_init_params* p) {
   if (g_init_para) {
     err("%s, already committed\n", __func__);
-    return -EIO;
+    MUDP_ERR_RET(EIO);
   }
 
   struct mufd_init_params* out = mt_zmalloc(sizeof(*out));
   if (!out) {
     err("%s, malloc out fail\n", __func__);
-    return -ENOMEM;
+    MUDP_ERR_RET(ENOMEM);
   }
   rte_memcpy(out, p, sizeof(*p));
   g_init_para = out;
@@ -571,8 +714,63 @@ int mufd_get_sessions_max_nb(void) {
   struct ufd_mt_ctx* ctx = ufd_get_mt_ctx(true);
   if (!ctx) {
     err("%s, fail to get ufd mt ctx\n", __func__);
-    return -EIO;
+    MUDP_ERR_RET(EIO);
   }
 
   return ufd_max_slot(ctx);
+}
+
+int mufd_init_context(void) {
+  struct ufd_mt_ctx* ctx = ufd_get_mt_ctx(true);
+  if (!ctx) MUDP_ERR_RET(EIO);
+  return 0;
+}
+
+int mufd_base_fd(void) {
+  struct ufd_mt_ctx* ctx = ufd_get_mt_ctx(true);
+  if (!ctx) MUDP_ERR_RET(EIO);
+  return ctx->init_params.fd_base;
+}
+
+enum mtl_log_level mufd_log_level(void) {
+  struct ufd_mt_ctx* ctx = ufd_get_mt_ctx(true);
+  if (!ctx) return MTL_LOG_LEVEL_INFO;
+  return ctx->init_params.mt_params.log_level;
+}
+
+int mufd_set_opaque(int sockfd, void* pri) {
+  struct ufd_slot* slot = ufd_fd2slot(sockfd);
+  int idx = slot->idx;
+
+  if (slot->opaque) {
+    err("%s(%d), opaque set already\n", __func__, idx);
+    MUDP_ERR_RET(EIO);
+  }
+
+  slot->opaque = pri;
+  return 0;
+}
+
+void* mufd_get_opaque(int sockfd) {
+  struct ufd_slot* slot = ufd_fd2slot(sockfd);
+  return slot->opaque;
+}
+
+int mufd_get_sip(int sockfd, uint8_t ip[MTL_IP_ADDR_LEN]) {
+  struct ufd_slot* slot = ufd_fd2slot(sockfd);
+  return mudp_get_sip(slot->handle, ip);
+}
+
+int mufd_tx_valid_ip(int sockfd, uint8_t dip[MTL_IP_ADDR_LEN]) {
+  struct ufd_slot* slot = ufd_fd2slot(sockfd);
+  return mudp_tx_valid_ip(slot->handle, dip);
+}
+
+int mufd_register_stat_dump_cb(int sockfd, int (*dump)(void* priv), void* priv) {
+  struct ufd_slot* slot = ufd_fd2slot(sockfd);
+  return mudp_register_stat_dump_cb(slot->handle, dump, priv);
+}
+
+int mufd_socket_check(int domain, int type, int protocol) {
+  return mudp_verify_socket_args(domain, type, protocol);
 }

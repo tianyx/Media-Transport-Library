@@ -317,10 +317,11 @@ static int rx_st20p_create_transport(struct mtl_main_impl* impl, struct st20p_rx
   memset(&ops_rx, 0, sizeof(ops_rx));
   ops_rx.name = ops->name;
   ops_rx.priv = ctx;
-  ops_rx.num_port = RTE_MIN(ops->port.num_port, MTL_PORT_MAX);
+  ops_rx.num_port = RTE_MIN(ops->port.num_port, MTL_SESSION_PORT_MAX);
   for (int i = 0; i < ops_rx.num_port; i++) {
     memcpy(ops_rx.sip_addr[i], ops->port.sip_addr[i], MTL_IP_ADDR_LEN);
     strncpy(ops_rx.port[i], ops->port.port[i], MTL_PORT_MAX_LEN);
+    ops_rx.udp_src_port[i] = ops->port.udp_src_port[i];
     ops_rx.udp_port[i] = ops->port.udp_port[i];
   }
   if (ops->flags & ST20P_RX_FLAG_DATA_PATH_ONLY)
@@ -329,6 +330,7 @@ static int rx_st20p_create_transport(struct mtl_main_impl* impl, struct st20p_rx
   if (ops->flags & ST20P_RX_FLAG_RECEIVE_INCOMPLETE_FRAME)
     ops_rx.flags |= ST20_RX_FLAG_RECEIVE_INCOMPLETE_FRAME;
   if (ops->flags & ST20P_RX_FLAG_DMA_OFFLOAD) ops_rx.flags |= ST20_RX_FLAG_DMA_OFFLOAD;
+  if (ops->flags & ST20P_RX_FLAG_HDR_SPLIT) ops_rx.flags |= ST20_RX_FLAG_HDR_SPLIT;
   if (ops->flags & ST20P_RX_FLAG_DISABLE_MIGRATE)
     ops_rx.flags |= ST20_RX_FLAG_DISABLE_MIGRATE;
   if (ops->flags & ST20P_RX_FLAG_PKT_CONVERT) {
@@ -360,14 +362,16 @@ static int rx_st20p_create_transport(struct mtl_main_impl* impl, struct st20p_rx
   if (ctx->derive) {
     /* ext frame info directly passed down to st20 lib */
     if (ops->ext_frames) {
-      trans_ext_frames =
-          mt_rte_zmalloc_socket(sizeof(*trans_ext_frames) * ctx->framebuff_cnt,
-                                mt_socket_id(ctx->impl, MTL_PORT_P));
+      uint16_t framebuff_cnt = ctx->framebuff_cnt;
+      /* hdr split use continuous frame */
+      if (ops->flags & ST20P_RX_FLAG_HDR_SPLIT) framebuff_cnt = 1;
+      trans_ext_frames = mt_rte_zmalloc_socket(sizeof(*trans_ext_frames) * framebuff_cnt,
+                                               mt_socket_id(ctx->impl, MTL_PORT_P));
       if (!trans_ext_frames) {
         err("%s, trans_ext_frames malloc fail\n", __func__);
         return -ENOMEM;
       }
-      for (int i = 0; i < ctx->framebuff_cnt; i++) {
+      for (uint16_t i = 0; i < framebuff_cnt; i++) {
         trans_ext_frames[i].buf_addr = ops->ext_frames[i].addr[0];
         trans_ext_frames[i].buf_iova = ops->ext_frames[i].iova[0];
         trans_ext_frames[i].buf_len = ops->ext_frames[i].size;
@@ -377,6 +381,7 @@ static int rx_st20p_create_transport(struct mtl_main_impl* impl, struct st20p_rx
     if (ops->query_ext_frame) {
       if (!(ops->flags & ST20P_RX_FLAG_RECEIVE_INCOMPLETE_FRAME)) {
         err("%s, pls enable incomplete frame flag for query ext mode\n", __func__);
+        if (trans_ext_frames) mt_rte_free(trans_ext_frames);
         return -EINVAL;
       }
       ops_rx.query_ext_frame = rx_st20p_query_ext_frame;
@@ -386,6 +391,7 @@ static int rx_st20p_create_transport(struct mtl_main_impl* impl, struct st20p_rx
   transport = st20_rx_create(impl, &ops_rx);
   if (!transport) {
     err("%s(%d), transport create fail\n", __func__, idx);
+    if (trans_ext_frames) mt_rte_free(trans_ext_frames);
     return -EIO;
   }
   ctx->transport = transport;

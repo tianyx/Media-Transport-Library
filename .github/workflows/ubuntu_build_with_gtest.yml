@@ -13,6 +13,7 @@ on:
       - meson_options.txt
       - VERSION
       - .github/workflows/ubuntu_build_with_gtest.yml
+      - '.github/workflows/upl*'
   pull_request:
     paths:
       - 'include/**'
@@ -25,6 +26,7 @@ on:
       - meson_options.txt
       - VERSION
       - .github/workflows/ubuntu_build_with_gtest.yml
+      - '.github/workflows/upl*'
 
 concurrency: 
   group: ${{ github.head_ref || github.run_id }}
@@ -34,15 +36,17 @@ env:
   # Customize the env if
   BUILD_TYPE: Release
   DPDK_VERSION: 22.11
-  TEST_PORT_P: 0000:31:00.0
-  TEST_PORT_R: 0000:31:00.1
-  TEST_DMA_PORT_P: 0000:00:01.0
-  TEST_DMA_PORT_R: 0000:00:01.1
+  TEST_PF_PORT_P: 0000:af:00.0
+  TEST_PF_PORT_R: 0000:af:00.0
+  TEST_PORT_P: 0000:af:01.0
+  TEST_PORT_R: 0000:af:01.1
+  TEST_DMA_PORT_P: 0000:80:04.0
+  TEST_DMA_PORT_R: 0000:80:04.1
 
 jobs:
   Build:
     if: github.repository == 'OpenVisualCloud/Media-Transport-Library'
-    runs-on: [Ubuntu, self-hosted]
+    runs-on: [Linux, self-hosted]
     timeout-minutes: 60
 
     steps:
@@ -58,7 +62,6 @@ jobs:
 
     - name: Install the build dependency
       run: |
-        sudo apt-get update -y
         sudo apt-get install -y git gcc meson python3 python3-pip pkg-config libnuma-dev libjson-c-dev libpcap-dev libgtest-dev libsdl2-dev libsdl2-ttf-dev libssl-dev
 
     - name: Install the python package
@@ -85,17 +88,17 @@ jobs:
   Test:
     if: github.repository == 'OpenVisualCloud/Media-Transport-Library'
     needs: Build
-    runs-on: [Ubuntu, self-hosted]
+    runs-on: [Linux, self-hosted]
     steps:
       - name: Kill previous gtest routine
         run: |
           sudo killall -SIGINT KahawaiTest || true
           sudo killall -SIGINT KahawaiUfdTest || true
+          sudo killall -SIGINT KahawaiUplTest || true
 
       - name: Binding network adapter
         run: |
-          sudo ./script/nicctl.sh bind_pmd ${{  env.TEST_PORT_P  }} || true
-          sudo ./script/nicctl.sh bind_pmd ${{  env.TEST_PORT_R  }} || true
+          sudo ./script/nicctl.sh create_vf ${{  env.TEST_PF_PORT_P  }} || true
           sudo ./dpdk/usertools/dpdk-devbind.py -b vfio-pci ${{  env.TEST_DMA_PORT_P  }} || true
           sudo ./dpdk/usertools/dpdk-devbind.py -b vfio-pci ${{  env.TEST_DMA_PORT_R  }} || true
 
@@ -107,6 +110,22 @@ jobs:
         run: |
           sudo ./build/tests/KahawaiUfdTest --p_port ${{  env.TEST_PORT_P  }} --r_port ${{  env.TEST_PORT_R  }} --queue_mode shared
 
-      - name: Run st2100 test case
+      - name: Run shared ufd test case with lcore
         run: |
-          sudo ./build/tests/KahawaiTest --auto_start_stop --p_port ${{  env.TEST_PORT_P  }} --r_port ${{  env.TEST_PORT_R  }} --dma_dev ${{  env.TEST_DMA_PORT_P  }},${{  env.TEST_DMA_PORT_R  }}
+          sudo ./build/tests/KahawaiUfdTest --p_port ${{  env.TEST_PORT_P  }} --r_port ${{  env.TEST_PORT_R  }} --queue_mode shared --udp_lcore
+
+      - name: Run ufd test case with rss
+        run: |
+          sudo ./build/tests/KahawaiUfdTest --p_port ${{  env.TEST_PORT_P  }} --r_port ${{  env.TEST_PORT_R  }} --queue_mode shared --udp_lcore --rss_mode l4_dst_port_only
+
+      - name: Run udp ld preload test case
+        run: |
+          sudo MUFD_CFG=.github/workflows/upl_gtest.json LD_PRELOAD=/usr/local/lib/x86_64-linux-gnu/libmtl_udp_preload.so ./build/tests/KahawaiUplTest --p_sip 192.168.89.80 --r_sip 192.168.89.81
+
+      - name: Run st2110 test case
+        run: |
+          sudo ./build/tests/KahawaiTest --auto_start_stop --p_port ${{  env.TEST_PORT_P  }} --r_port ${{  env.TEST_PORT_R  }} --dma_dev ${{  env.TEST_DMA_PORT_P  }},${{  env.TEST_DMA_PORT_R  }} --gtest_filter=-St22_?x.*
+
+      - name: Run st2110 st20p test case in simulation ENA environment
+        run: |
+          sudo ./build/tests/KahawaiTest --auto_start_stop --p_port ${{  env.TEST_PORT_P  }} --r_port ${{  env.TEST_PORT_R  }} --rss_mode l3_l4 --pacing_way tsc --iova_mode pa --multi_src_port --gtest_filter=Main.*:St20p*:-*ext*

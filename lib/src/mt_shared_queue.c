@@ -8,7 +8,6 @@
 #include "mt_log.h"
 #include "mt_stat.h"
 #include "mt_util.h"
-#include "mudp_api.h"
 
 static inline struct mt_rsq_impl* rsq_ctx_get(struct mtl_main_impl* impl,
                                               enum mtl_port port) {
@@ -22,8 +21,8 @@ static int rsq_stat_dump(void* priv) {
   for (uint16_t q = 0; q < rsq->max_rsq_queues; q++) {
     s = &rsq->rsq_queues[q];
     if (s->stat_pkts_recv) {
-      info("%s(%d,%u), entries %d, pkt recv %d deliver %d\n", __func__, rsq->port, q,
-           rte_atomic32_read(&s->entry_cnt), s->stat_pkts_recv, s->stat_pkts_deliver);
+      notice("%s(%d,%u), entries %d, pkt recv %d deliver %d\n", __func__, rsq->port, q,
+             rte_atomic32_read(&s->entry_cnt), s->stat_pkts_recv, s->stat_pkts_deliver);
       s->stat_pkts_recv = 0;
       s->stat_pkts_deliver = 0;
     }
@@ -33,10 +32,10 @@ static int rsq_stat_dump(void* priv) {
 }
 
 static int rsq_entry_free(struct mt_rsq_entry* entry) {
-  struct mt_rsq_impl* rsqm = entry->parnet;
+  struct mt_rsq_impl* rsqm = entry->parent;
 
   if (entry->flow_rsp) {
-    mt_dev_free_rx_flow(rsqm->parnet, rsqm->port, entry->flow_rsp);
+    mt_dev_free_rx_flow(rsqm->parent, rsqm->port, entry->flow_rsp);
     entry->flow_rsp = NULL;
   }
   mt_rte_free(entry);
@@ -63,7 +62,7 @@ static int rsq_uinit(struct mt_rsq_impl* rsq) {
     rsq->rsq_queues = NULL;
   }
 
-  mt_stat_unregister(rsq->parnet, rsq_stat_dump, rsq);
+  mt_stat_unregister(rsq->parent, rsq_stat_dump, rsq);
 
   return 0;
 }
@@ -109,7 +108,7 @@ static uint32_t rsq_flow_hash(struct mt_rx_flow* flow) {
                             flow->dip_addr[3]);
   tuple.dst_addr = RTE_IPV4(flow->sip_addr[0], flow->sip_addr[1], flow->sip_addr[2],
                             flow->sip_addr[3]);
-  tuple.sport = flow->dst_port;
+  tuple.sport = flow->src_port;
   tuple.dport = flow->dst_port;
   return mt_dev_softrss((uint32_t*)&tuple, len);
 }
@@ -132,7 +131,7 @@ struct mt_rsq_entry* mt_rsq_get(struct mtl_main_impl* impl, enum mtl_port port,
     return NULL;
   }
   entry->queue_id = q;
-  entry->parnet = rsqm;
+  entry->parent = rsqm;
   rte_memcpy(&entry->flow, flow, sizeof(entry->flow));
   entry->dst_port_net = htons(flow->dst_port);
 
@@ -157,7 +156,7 @@ struct mt_rsq_entry* mt_rsq_get(struct mtl_main_impl* impl, enum mtl_port port,
 }
 
 int mt_rsq_put(struct mt_rsq_entry* entry) {
-  struct mt_rsq_impl* rsqm = entry->parnet;
+  struct mt_rsq_impl* rsqm = entry->parent;
   struct mt_rsq_queue* rsq_queue = &rsqm->rsq_queues[entry->queue_id];
 
   mt_pthread_mutex_lock(&rsq_queue->mutex);
@@ -170,7 +169,7 @@ int mt_rsq_put(struct mt_rsq_entry* entry) {
 }
 
 uint16_t mt_rsq_burst(struct mt_rsq_entry* entry, uint16_t nb_pkts) {
-  struct mt_rsq_impl* rsqm = entry->parnet;
+  struct mt_rsq_impl* rsqm = entry->parent;
   uint16_t q = entry->queue_id;
   struct mt_rsq_queue* rsq_queue = &rsqm->rsq_queues[q];
   struct rte_mbuf* pkts[nb_pkts];
@@ -190,7 +189,7 @@ uint16_t mt_rsq_burst(struct mt_rsq_entry* entry, uint16_t nb_pkts) {
         ntohs(udp->dst_port), ntohs(udp->src_port));
     MT_TAILQ_FOREACH(rsq_entry, &rsq_queue->head, next) {
       /* check if this is the matched pkt or sys entry */
-      /* only check udp port now, todo chech ip if ip_flow is enabled */
+      /* only check udp port now, todo check ip if ip_flow is enabled */
       if (rsq_entry->dst_port_net == udp->dst_port) {
         rsq_entry->flow.cb(rsq_entry->flow.priv, &pkts[i], 1);
         rsq_queue->stat_pkts_deliver++;
@@ -222,7 +221,7 @@ int mt_rsq_init(struct mtl_main_impl* impl) {
       mt_rsq_uinit(impl);
       return -ENOMEM;
     }
-    impl->rsq[i]->parnet = impl;
+    impl->rsq[i]->parent = impl;
     impl->rsq[i]->port = i;
     impl->rsq[i]->max_rsq_queues = mt_if(impl, i)->max_rx_queues;
     ret = rsq_init(impl, impl->rsq[i]);
@@ -261,8 +260,8 @@ static int tsq_stat_dump(void* priv) {
   for (uint16_t q = 0; q < tsq->max_tsq_queues; q++) {
     s = &tsq->tsq_queues[q];
     if (s->stat_pkts_send) {
-      info("%s(%d,%u), entries %d, pkt send %d\n", __func__, tsq->port, q,
-           rte_atomic32_read(&s->entry_cnt), s->stat_pkts_send);
+      notice("%s(%d,%u), entries %d, pkt send %d\n", __func__, tsq->port, q,
+             rte_atomic32_read(&s->entry_cnt), s->stat_pkts_send);
       s->stat_pkts_send = 0;
     }
   }
@@ -300,7 +299,7 @@ static int tsq_uinit(struct mt_tsq_impl* tsq) {
     tsq->tsq_queues = NULL;
   }
 
-  mt_stat_unregister(tsq->parnet, tsq_stat_dump, tsq);
+  mt_stat_unregister(tsq->parent, tsq_stat_dump, tsq);
 
   return 0;
 }
@@ -369,7 +368,7 @@ struct mt_tsq_entry* mt_tsq_get(struct mtl_main_impl* impl, enum mtl_port port,
     return NULL;
   }
   entry->queue_id = q;
-  entry->parnet = tsqm;
+  entry->parent = tsqm;
   rte_memcpy(&entry->flow, flow, sizeof(entry->flow));
 
   mt_pthread_mutex_lock(&tsq_queue->mutex);
@@ -378,7 +377,7 @@ struct mt_tsq_entry* mt_tsq_get(struct mtl_main_impl* impl, enum mtl_port port,
     snprintf(pool_name, 32, "TSQ-P%d-Q%u", port, q);
     struct rte_mempool* pool =
         mt_mempool_create(impl, port, pool_name, mt_if_nb_tx_desc(impl, port) + 512,
-                          MT_MBUF_CACHE_SIZE, 0, MUDP_MAX_BYTES);
+                          MT_MBUF_CACHE_SIZE, 0, MTL_MTU_MAX_BYTES);
     if (!pool) {
       err("%s(%d:%u), mempool create fail\n", __func__, port, q);
       mt_pthread_mutex_unlock(&tsq_queue->mutex);
@@ -400,7 +399,7 @@ struct mt_tsq_entry* mt_tsq_get(struct mtl_main_impl* impl, enum mtl_port port,
 }
 
 int mt_tsq_put(struct mt_tsq_entry* entry) {
-  struct mt_tsq_impl* tsqm = entry->parnet;
+  struct mt_tsq_impl* tsqm = entry->parent;
   struct mt_tsq_queue* tsq_queue = &tsqm->tsq_queues[entry->queue_id];
 
   mt_pthread_mutex_lock(&tsq_queue->mutex);
@@ -414,7 +413,7 @@ int mt_tsq_put(struct mt_tsq_entry* entry) {
 
 uint16_t mt_tsq_burst(struct mt_tsq_entry* entry, struct rte_mbuf** tx_pkts,
                       uint16_t nb_pkts) {
-  struct mt_tsq_impl* tsqm = entry->parnet;
+  struct mt_tsq_impl* tsqm = entry->parent;
   struct mt_tsq_queue* tsq_queue = &tsqm->tsq_queues[entry->queue_id];
   uint16_t tx;
 
@@ -449,7 +448,7 @@ uint16_t mt_tsq_burst_busy(struct mtl_main_impl* impl, struct mt_tsq_entry* entr
 
 int mt_tsq_flush(struct mtl_main_impl* impl, struct mt_tsq_entry* entry,
                  struct rte_mbuf* pad) {
-  struct mt_tsq_impl* tsqm = entry->parnet;
+  struct mt_tsq_impl* tsqm = entry->parent;
   enum mtl_port port = tsqm->port;
   uint16_t queue_id = entry->queue_id;
 
@@ -468,7 +467,7 @@ int mt_tsq_flush(struct mtl_main_impl* impl, struct mt_tsq_entry* entry,
 
 int mt_tsq_set_bps(struct mtl_main_impl* impl, struct mt_tsq_entry* entry,
                    uint64_t bytes_per_sec) {
-  struct mt_tsq_impl* tsqm = entry->parnet;
+  struct mt_tsq_impl* tsqm = entry->parent;
   enum mtl_port port = tsqm->port;
   struct mt_tsq_queue* tsq_queue = &tsqm->tsq_queues[entry->queue_id];
   uint16_t q = entry->queue_id;
@@ -492,7 +491,7 @@ int mt_tsq_init(struct mtl_main_impl* impl) {
       mt_tsq_uinit(impl);
       return -ENOMEM;
     }
-    impl->tsq[i]->parnet = impl;
+    impl->tsq[i]->parent = impl;
     impl->tsq[i]->port = i;
     impl->tsq[i]->max_tsq_queues = mt_if(impl, i)->max_tx_queues;
     ret = tsq_init(impl, impl->tsq[i]);

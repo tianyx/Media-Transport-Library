@@ -5,7 +5,7 @@
 /**
  * @file st30_api.h
  *
- * Interfaces to Media Transport Library for st2110-30 transport.
+ * Interfaces for st2110-30 transport.
  *
  */
 
@@ -53,7 +53,7 @@ typedef struct st_rx_audio_session_handle_impl* st30_rx_handle;
 
 /**
  * Flag bit in flags of struct st30_rx_ops, for non MTL_PMD_DPDK_USER.
- * If set, it's application duty to set the rx flow(queue) and muticast join/drop.
+ * If set, it's application duty to set the rx flow(queue) and multicast join/drop.
  * Use st30_rx_get_queue_meta to get the queue meta(queue number etc) info.
  */
 #define ST30_RX_FLAG_DATA_PATH_ONLY (MTL_BIT32(0))
@@ -234,13 +234,15 @@ struct st30_tx_ops {
   /** private data to the callback function */
   void* priv;
   /** destination IP address */
-  uint8_t dip_addr[MTL_PORT_MAX][MTL_IP_ADDR_LEN];
+  uint8_t dip_addr[MTL_SESSION_PORT_MAX][MTL_IP_ADDR_LEN];
   /** Pcie BDF path like 0000:af:00.0, should align to BDF of mtl_init */
-  char port[MTL_PORT_MAX][MTL_PORT_MAX_LEN];
+  char port[MTL_SESSION_PORT_MAX][MTL_PORT_MAX_LEN];
   /** 1 or 2, num of ports this session attached to */
   uint8_t num_port;
-  /** UDP port number */
-  uint16_t udp_port[MTL_PORT_MAX];
+  /** UDP source port number, leave as 0 to use same port as dst */
+  uint16_t udp_src_port[MTL_SESSION_PORT_MAX];
+  /** UDP destination port number */
+  uint16_t udp_port[MTL_SESSION_PORT_MAX];
 
   /** Session payload format */
   enum st30_fmt fmt;
@@ -270,7 +272,7 @@ struct st30_tx_ops {
    * tx destination mac address.
    * Valid if ST30_TX_FLAG_USER_P(R)_MAC is enabled
    */
-  uint8_t tx_dst_mac[MTL_PORT_MAX][MTL_MAC_ADDR_LEN];
+  uint8_t tx_dst_mac[MTL_SESSION_PORT_MAX][MTL_MAC_ADDR_LEN];
 
   /**
    * the frame buffer count requested for one st30 tx session,
@@ -284,7 +286,7 @@ struct st30_tx_ops {
   uint32_t framebuff_size;
   /**
    * ST30_TYPE_FRAME_LEVEL callback when lib require a new frame.
-   * User should provide the next avaiable frame index to next_frame_idx.
+   * User should provide the next available frame index to next_frame_idx.
    * It implicit means the frame ownership will be transferred to lib,
    * only for ST30_TYPE_FRAME_LEVEL.
    * And only non-block method can be used in this callback as it run from lcore tasklet
@@ -327,13 +329,15 @@ struct st30_rx_ops {
   /** private data to the callback function */
   void* priv;
   /** source IP address of sender */
-  uint8_t sip_addr[MTL_PORT_MAX][MTL_IP_ADDR_LEN];
+  uint8_t sip_addr[MTL_SESSION_PORT_MAX][MTL_IP_ADDR_LEN];
   /** 1 or 2, num of ports this session attached to */
   uint8_t num_port;
   /** Pcie BDF path like 0000:af:00.0, should align to BDF of mtl_init */
-  char port[MTL_PORT_MAX][MTL_PORT_MAX_LEN];
-  /** UDP port number */
-  uint16_t udp_port[MTL_PORT_MAX];
+  char port[MTL_SESSION_PORT_MAX][MTL_PORT_MAX_LEN];
+  /** UDP source port number, leave as 0 to use same port as dst */
+  uint16_t udp_src_port[MTL_SESSION_PORT_MAX];
+  /** UDP destination port number */
+  uint16_t udp_port[MTL_SESSION_PORT_MAX];
   /** flags, value in ST30_RX_FLAG_* */
   uint32_t flags;
 
@@ -377,7 +381,7 @@ struct st30_rx_ops {
    * return:
    *   - 0: if app consume the frame successful. App should call st30_rx_put_framebuff
    * to return the frame when it finish the handling
-   *   < 0: the error code if app cann't handle, lib will free the frame then
+   *   < 0: the error code if app can't handle, lib will free the frame then
    * the consume of frame.
    * only for ST30_TX_TYPE_FRAME_LEVEL.
    * And only non-block method can be used in this callback as it run from lcore tasklet
@@ -446,7 +450,7 @@ void* st30_tx_get_framebuffer(st30_tx_handle handle, uint16_t idx);
  * @param usrptr
  *   *usrptr will be point to the user data(rtp) area inside the mbuf.
  * @return
- *   - NULL if no avaiable mbuf in the ring.
+ *   - NULL if no available mbuf in the ring.
  *   - Otherwise, the dpdk mbuf pointer.
  */
 void* st30_tx_get_mbuf(st30_tx_handle handle, void** usrptr);
@@ -577,7 +581,7 @@ int st30_rx_put_framebuff(st30_rx_handle handle, void* frame);
  * @param len
  *   The length of the rtp packet, include both the header and payload.
  * @return
- *   - NULL if no avaiable mbuf in the ring.
+ *   - NULL if no available mbuf in the ring.
  *   - Otherwise, the dpdk mbuf pointer.
  */
 void* st30_rx_get_mbuf(st30_rx_handle handle, void** usrptr, uint16_t* len);

@@ -14,7 +14,7 @@ struct tv_split_sample_ctx {
 
   size_t frame_size; /* 1080p */
   size_t fb_size;    /* whole 4k */
-  int fb_idx;        /* currrent frame buffer index */
+  int fb_idx;        /* current frame buffer index */
   int fb_total;      /* total frame buffers read from yuv file */
   size_t fb_offset;
 
@@ -101,14 +101,16 @@ int main(int argc, char** argv) {
     ops_tx.name = "st20_tx";
     ops_tx.priv = app[i];  // app handle register to lib
     ops_tx.num_port = 1;
-    memcpy(ops_tx.dip_addr[MTL_PORT_P], ctx.tx_dip_addr[MTL_PORT_P], MTL_IP_ADDR_LEN);
-    strncpy(ops_tx.port[MTL_PORT_P], ctx.param.port[MTL_PORT_P], MTL_PORT_MAX_LEN);
+    memcpy(ops_tx.dip_addr[MTL_SESSION_PORT_P], ctx.tx_dip_addr[MTL_PORT_P],
+           MTL_IP_ADDR_LEN);
+    strncpy(ops_tx.port[MTL_SESSION_PORT_P], ctx.param.port[MTL_PORT_P],
+            MTL_PORT_MAX_LEN);
 
     struct st20_pgroup st20_pg;
     st20_get_pgroup(ST20_FMT_YUV_422_10BIT, &st20_pg);
 
     ops_tx.flags |= ST20_TX_FLAG_EXT_FRAME;
-    ops_tx.udp_port[MTL_PORT_P] = ctx.udp_port + i;
+    ops_tx.udp_port[MTL_SESSION_PORT_P] = ctx.udp_port + i;
     ops_tx.pacing = ST21_PACING_NARROW;
     ops_tx.packing = ST20_PACKING_GPM_SL;
     ops_tx.type = ST20_TYPE_FRAME_LEVEL;
@@ -119,7 +121,7 @@ int main(int argc, char** argv) {
     ops_tx.fmt = ctx.fmt;
     ops_tx.payload_type = ctx.payload_type;
     ops_tx.framebuff_cnt = app[i]->fb_cnt;
-    // app regist non-block func, app could get a frame to send to lib
+    // app register non-block func, app could get a frame to send to lib
     ops_tx.get_next_frame = tx_video_next_frame;
     ops_tx.notify_frame_done = tx_video_frame_done;
     tx_handle[i] = st20_tx_create(ctx.st, &ops_tx);

@@ -39,6 +39,10 @@ enum test_args_cmd {
   TEST_ARG_TSC_PACING,
   TEST_ARG_RXTX_SIMD_512,
   TEST_ARG_PACING_WAY,
+  TEST_ARG_RSS_MODE,
+  TEST_ARG_TX_NO_CHAIN,
+  TEST_ARG_IOVA_MODE,
+  TEST_ARG_MULTI_SRC_PORT,
 };
 
 static struct option test_args_options[] = {
@@ -70,6 +74,10 @@ static struct option test_args_options[] = {
     {"tsc", no_argument, 0, TEST_ARG_TSC_PACING},
     {"rxtx_simd_512", no_argument, 0, TEST_ARG_RXTX_SIMD_512},
     {"pacing_way", required_argument, 0, TEST_ARG_PACING_WAY},
+    {"rss_mode", required_argument, 0, TEST_ARG_RSS_MODE},
+    {"tx_no_chain", no_argument, 0, TEST_ARG_TX_NO_CHAIN},
+    {"iova_mode", required_argument, 0, TEST_ARG_IOVA_MODE},
+    {"multi_src_port", no_argument, 0, TEST_ARG_MULTI_SRC_PORT},
 
     {0, 0, 0, 0}};
 
@@ -221,8 +229,40 @@ static int test_parse_args(struct st_tests_context* ctx, struct mtl_init_params*
           p->pacing = ST21_TX_PACING_WAY_TSC;
         else if (!strcmp(optarg, "ptp"))
           p->pacing = ST21_TX_PACING_WAY_PTP;
+        else if (!strcmp(optarg, "be"))
+          p->pacing = ST21_TX_PACING_WAY_BE;
         else
           err("%s, unknow pacing way %s\n", __func__, optarg);
+        break;
+      case TEST_ARG_RSS_MODE:
+        if (!strcmp(optarg, "l3"))
+          p->rss_mode = MTL_RSS_MODE_L3;
+        else if (!strcmp(optarg, "l3_l4"))
+          p->rss_mode = MTL_RSS_MODE_L3_L4;
+        else if (!strcmp(optarg, "l3_l4_dst_port_only"))
+          p->rss_mode = MTL_RSS_MODE_L3_L4_DP_ONLY;
+        else if (!strcmp(optarg, "l3_da_l4_dst_port_only"))
+          p->rss_mode = MTL_RSS_MODE_L3_DA_L4_DP_ONLY;
+        else if (!strcmp(optarg, "l4_dst_port_only"))
+          p->rss_mode = MTL_RSS_MODE_L4_DP_ONLY;
+        else if (!strcmp(optarg, "none"))
+          p->rss_mode = MTL_RSS_MODE_NONE;
+        else
+          err("%s, unknow rss mode %s\n", __func__, optarg);
+        break;
+      case TEST_ARG_TX_NO_CHAIN:
+        p->flags |= MTL_FLAG_TX_NO_CHAIN;
+        break;
+      case TEST_ARG_IOVA_MODE:
+        if (!strcmp(optarg, "va"))
+          p->iova_mode = MTL_IOVA_MODE_VA;
+        else if (!strcmp(optarg, "pa"))
+          p->iova_mode = MTL_IOVA_MODE_PA;
+        else
+          err("%s, unknow iova mode %s\n", __func__, optarg);
+        break;
+      case TEST_ARG_MULTI_SRC_PORT:
+        p->flags |= MTL_FLAG_MULTI_SRC_PORT;
         break;
       default:
         break;
@@ -248,16 +288,25 @@ static void test_random_ip(struct st_tests_context* ctx) {
   r_ip[2] = p_ip[2];
   r_ip[3] = p_ip[3] + 1;
 
-  p_ip = ctx->mcast_ip_addr[MTL_PORT_P];
-  r_ip = ctx->mcast_ip_addr[MTL_PORT_R];
-  p_ip[0] = 239;
-  p_ip[1] = rand() % 0xFF;
-  p_ip[2] = rand() % 0xFF;
-  p_ip[3] = rand() % 0xFF;
-  r_ip[0] = p_ip[0];
-  r_ip[1] = p_ip[1];
-  r_ip[2] = p_ip[2];
-  r_ip[3] = p_ip[3] + 1;
+  /* MTL_RSS_MODE_L3_L4_DP_ONLY not support mcast */
+  if (p->rss_mode == MTL_RSS_MODE_L3_L4_DP_ONLY) {
+    memcpy(ctx->mcast_ip_addr[MTL_PORT_P], mtl_r_sip_addr(p),
+           sizeof(ctx->mcast_ip_addr[MTL_PORT_P]));
+    memcpy(ctx->mcast_ip_addr[MTL_PORT_R], mtl_p_sip_addr(p),
+           sizeof(ctx->mcast_ip_addr[MTL_PORT_R]));
+  } else {
+    p_ip = ctx->mcast_ip_addr[MTL_PORT_P];
+    r_ip = ctx->mcast_ip_addr[MTL_PORT_R];
+
+    p_ip[0] = 239;
+    p_ip[1] = rand() % 0xFF;
+    p_ip[2] = rand() % 0xFF;
+    p_ip[3] = rand() % 0xFF;
+    r_ip[0] = p_ip[0];
+    r_ip[1] = p_ip[1];
+    r_ip[2] = p_ip[2];
+    r_ip[3] = p_ip[3] + 1;
+  }
 }
 
 static uint64_t test_ptp_from_real_time(void* priv) {
@@ -300,12 +349,13 @@ static void test_ctx_init(struct st_tests_context* ctx) {
 #endif
   memset(p, 0x0, sizeof(*p));
   p->flags = MTL_FLAG_BIND_NUMA; /* default bind to numa */
+  p->flags |= MTL_FLAG_RANDOM_SRC_PORT;
   p->log_level = MTL_LOG_LEVEL_ERROR;
   p->priv = ctx;
   p->ptp_get_time_fn = test_ptp_from_real_time;
   p->tx_sessions_cnt_max = 16;
   p->rx_sessions_cnt_max = 16;
-  /* defalut start queue set to 1 */
+  /* default start queue set to 1 */
   p->xdp_info[MTL_PORT_P].start_queue = 1;
   p->xdp_info[MTL_PORT_R].start_queue = 1;
 

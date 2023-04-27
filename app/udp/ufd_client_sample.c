@@ -6,6 +6,9 @@
 
 /* include "struct sockaddr_in" define before include mudp_sockfd_api */
 // clang-format off
+#ifdef WINDOWSENV
+#include <mtl/mudp_win.h>
+#endif
 #include <mtl/mudp_sockfd_api.h>
 // clang-format on
 
@@ -143,23 +146,12 @@ static void ufd_client_sig_handler(int signo) {
 int main(int argc, char** argv) {
   struct st_sample_context ctx;
   int ret;
-  struct mufd_override_params override;
-  bool has_override = false;
 
   memset(&ctx, 0, sizeof(ctx));
   ret = sample_parse_args(&ctx, argc, argv, true, false, true);
   if (ret < 0) return ret;
 
-  memset(&override, 0, sizeof(override));
-  override.log_level = MTL_LOG_LEVEL_INFO;
-  /* check if user has assigned log level */
-  if (ctx.param.log_level != MTL_LOG_LEVEL_INFO) {
-    has_override = true;
-    override.log_level = ctx.param.log_level;
-  }
-  if (has_override) {
-    mufd_commit_override_params(&override);
-  }
+  ufd_override_check(&ctx);
 
   ctx.sig_handler = ufd_client_sig_handler;
 
@@ -231,15 +223,6 @@ int main(int argc, char** argv) {
     }
   }
 
-  // stop app thread
-  for (int i = 0; i < session_num; i++) {
-    app[i]->stop = true;
-    st_pthread_mutex_lock(&app[i]->wake_mutex);
-    st_pthread_cond_signal(&app[i]->wake_cond);
-    st_pthread_mutex_unlock(&app[i]->wake_mutex);
-    pthread_join(app[i]->thread, NULL);
-  }
-
   // check result
   ret = 0;
   for (int i = 0; i < session_num; i++) {
@@ -257,12 +240,18 @@ int main(int argc, char** argv) {
 
 error:
   for (int i = 0; i < session_num; i++) {
-    if (app[i]) {
-      if (app[i]->socket >= 0) mufd_close(app[i]->socket);
-      st_pthread_mutex_destroy(&app[i]->wake_mutex);
-      st_pthread_cond_destroy(&app[i]->wake_cond);
-      free(app[i]);
-    }
+    if (!app[i]) continue;
+    // stop app thread
+    app[i]->stop = true;
+    st_pthread_mutex_lock(&app[i]->wake_mutex);
+    st_pthread_cond_signal(&app[i]->wake_cond);
+    st_pthread_mutex_unlock(&app[i]->wake_mutex);
+    if (app[i]->thread) pthread_join(app[i]->thread, NULL);
+
+    if (app[i]->socket >= 0) mufd_close(app[i]->socket);
+    st_pthread_mutex_destroy(&app[i]->wake_mutex);
+    st_pthread_cond_destroy(&app[i]->wake_cond);
+    free(app[i]);
   }
 
   return ret;
