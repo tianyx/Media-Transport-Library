@@ -50,6 +50,11 @@ typedef struct st_rx_audio_session_handle_impl* st30_rx_handle;
  * st30_tx_frame_meta(ST10_TIMESTAMP_FMT_MEDIA_CLK is used)
  */
 #define ST30_TX_FLAG_USER_TIMESTAMP (MTL_BIT32(4))
+/**
+ * Flag bit in flags of struct st30_tx_ops.
+ * Control frame pacing in the build stage also.
+ */
+#define ST30_TX_FLAG_BUILD_PACING (MTL_BIT32(5))
 
 /**
  * Flag bit in flags of struct st30_rx_ops, for non MTL_PMD_DPDK_USER.
